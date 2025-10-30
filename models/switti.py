@@ -10,6 +10,7 @@ from diffusers.models.embeddings import GaussianFourierProjection
 import dist
 from models.basic_switti import AdaLNBeforeHead, AdaLNSelfCrossAttn
 from models.rope import compute_axial_cis
+from models.control_encoder import ControlEncoder
 from utils.arg_util import RESOLUTION_PATCH_NUMS_MAPPING
 
 def get_crop_condition(
@@ -54,6 +55,10 @@ class Switti(nn.Module):
         use_swiglu_ffn=True,
         use_ar=False,
         use_crop_cond=True,
+        control_encoder_type: str | None = None,
+        control_context_dim: int = 512,
+        control_patch_size: int | None = None,
+        control_pretrained: bool | None = True,
     ):
         super().__init__()
         # 0. hyperparameters
@@ -119,6 +124,20 @@ class Switti(nn.Module):
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
 
+        # --- control encoder (optional) ---
+        self.control_encoder_type = control_encoder_type
+        self.control_pretrained = control_pretrained
+        self.control_context_dim = control_context_dim if control_encoder_type is not None else None
+
+        if control_encoder_type is not None:
+            self.control_encoder = ControlEncoder(
+                encoder_type=control_encoder_type,
+                control_context_dim=control_context_dim,
+                pretrained=control_pretrained,
+            )
+        else:
+            self.control_encoder = None
+
         # 4. backbone blocks
         self.drop_path_rate = drop_path_rate
         # stochastic depth decay rule (linearly increasing)
@@ -138,6 +157,7 @@ class Switti(nn.Module):
                     last_drop_p=0 if block_idx == 0 else dpr[block_idx - 1],
                     qk_norm=attn_l2_norm,
                     context_dim=self.context_dim,
+                    control_context_dim=self.control_context_dim,
                     use_swiglu_ffn=use_swiglu_ffn,
                     norm_eps=norm_eps,
                     use_crop_cond=use_crop_cond,
@@ -217,12 +237,14 @@ class Switti(nn.Module):
 
     def forward(
         self,
-        x_BLCv_wo_first_l: torch.Tensor,
+        x_BLCv_wo_first_l: torch.Tensor, # Encoded image tokens from the previous (coarser) scale
         prompt_embeds: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
         prompt_attn_bias: torch.Tensor,
         batch_height: list[int] | None = None,
         batch_width: list[int] | None = None,
+        control_image: torch.Tensor | None = None,
+        control_attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:  # returns logits_BLV
         """
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
@@ -236,7 +258,7 @@ class Switti(nn.Module):
         :param batch_height (B,): original height of images in a batch.
         :param batch_width (B,): original width of images in a batch.
         Only used when self.use_crop_cond = True
-        :return: logits BLV, V is vocab_size
+        :return: logits BLV, V is vocab_size. Token probabilities for the next scale
         """
         bg, ed = 0, self.L
         B = x_BLCv_wo_first_l.shape[0]
@@ -273,6 +295,20 @@ class Switti(nn.Module):
         cond_BD = cond_BD.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
+        # --- control encoding (optional) ---
+        control_context = None
+        control_context_attn_bias = None
+        if control_image is not None and self.control_encoder is not None:
+            # assume control_image is normalized and shape (B,3,H,W)
+            control_tokens = self.control_encoder(control_image)  # (B, Lc, ctrl_dim)
+            # optionally create an attention mask: None or from control_attn_mask
+            control_context = control_tokens.to(dtype=main_type)
+            if control_attn_mask is not None:
+                # mask shape expected: (B, Lc) boolean; convert to attn bias shape (B, Lq, 1, Lc) or just pass None
+                # AdaLNSelfCrossAttn/CrossAttention expect `context_attn_bias` shaped (B, Lc) or attn_mask style
+                control_context_attn_bias = control_attn_mask.to(dtype=main_type)
+
+
         for block in self.blocks:
             if self.use_gradient_checkpointing:
                 x_BLC = torch.utils.checkpoint.checkpoint(
@@ -284,6 +320,8 @@ class Switti(nn.Module):
                     freqs_cis=self.freqs_cis,
                     context_attn_bias=prompt_attn_bias,
                     crop_cond=crop_cond,
+                    control_context=control_context,
+                    control_context_attn_bias=control_context_attn_bias,
                     use_reentrant=False,
                 )
             else:
@@ -295,6 +333,8 @@ class Switti(nn.Module):
                     freqs_cis=self.freqs_cis,
                     context_attn_bias=prompt_attn_bias,
                     crop_cond=crop_cond,
+                    control_context=control_context,
+                    control_context_attn_bias=control_context_attn_bias,
                 )
 
         with torch.amp.autocast('cuda', enabled=not self.training):

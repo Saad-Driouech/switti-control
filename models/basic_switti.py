@@ -347,6 +347,7 @@ class AdaLNSelfCrossAttn(nn.Module):
         drop_path=0.0,
         qk_norm=False,
         context_dim=None,
+        control_context_dim=None,   # dim for control tokens (image control)
         use_swiglu_ffn=False,
         norm_eps=1e-6,
         use_crop_cond=False,
@@ -379,6 +380,19 @@ class AdaLNSelfCrossAttn(nn.Module):
         else:
             self.cross_attn = None
 
+        # Cross-attn: control context (image control) 
+        if control_context_dim:
+            self.cross_attn_control = CrossAttention(
+                embed_dim=embed_dim,
+                context_dim=control_context_dim,
+                num_heads=num_heads,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+                qk_norm=qk_norm,
+            )
+        else:
+            self.cross_attn_control = None
+
         if use_swiglu_ffn:
             self.ffn = SwiGLUFFN(dim=embed_dim)
         else:
@@ -392,11 +406,18 @@ class AdaLNSelfCrossAttn(nn.Module):
         self.self_attention_norm2 = RMSNorm(embed_dim, eps=norm_eps)
         self.cross_attention_norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.cross_attention_norm2 = RMSNorm(embed_dim, eps=norm_eps)
+        self.cross_attention_control_norm = (
+            RMSNorm(embed_dim, eps=norm_eps) if control_context_dim else None
+        )
+        self.cross_attention_norm_text_input = RMSNorm(embed_dim, eps=norm_eps)
 
         self.ffn_norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(embed_dim, eps=norm_eps)
 
-        self.attention_y_norm = RMSNorm(context_dim, eps=norm_eps)
+        self.attention_y_norm = RMSNorm(context_dim, eps=norm_eps) if context_dim else None
+        self.attention_control_norm = (
+            RMSNorm(control_context_dim, eps=norm_eps) if control_context_dim else None
+        )
 
         # AdaLN
         lin = nn.Linear(cond_dim, 6 * embed_dim)
@@ -417,6 +438,8 @@ class AdaLNSelfCrossAttn(nn.Module):
         crop_cond=None,
         context=None,
         context_attn_bias=None,
+        control_context=None,
+        control_context_attn_bias=None,
         freqs_cis=None,
     ):  # C: embed_dim, D: cond_dim
         
@@ -434,18 +457,41 @@ class AdaLNSelfCrossAttn(nn.Module):
                 freqs_cis=freqs_cis,
             )
         ).mul(gamma1)
-        if context is not None:
+
+        # Cross-attention to primary context (text)
+        if context is not None and self.cross_attn is not None:
+            normed_context = self.attention_y_norm(context) if self.attention_y_norm is not None else context
             x = x + self.cross_attention_norm2(
                 self.cross_attn(
                     self.cross_attention_norm1(x),
-                    self.attention_y_norm(context),
+                    normed_context,
                     context_attn_bias=context_attn_bias,
                     freqs_cis=freqs_cis,
                 )
             )
+
+        # Cross-attention to control context (image-control) 
+        if control_context is not None and self.cross_attn_control is not None:
+            normed_ctrl = (
+                self.attention_control_norm(control_context)
+                if self.attention_control_norm is not None
+                else control_context
+            )
+            x = x + (
+                self.cross_attention_control_norm(
+                    self.cross_attn_control(
+                        self.cross_attention_norm1(x),  # queries use same norm
+                        normed_ctrl,
+                        context_attn_bias=control_context_attn_bias,
+                        freqs_cis=freqs_cis,
+                    )
+                )
+            )
+            
         x = x + self.ffn_norm2(
             self.ffn(self.ffn_norm1(x).mul(scale2.add(1)).add(shift2))
         ).mul(gamma2)
+
         return x
 
 
