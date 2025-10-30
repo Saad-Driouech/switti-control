@@ -57,7 +57,7 @@ class Switti(nn.Module):
         use_crop_cond=True,
         control_encoder_type: str | None = None,
         control_context_dim: int = 512,
-        control_patch_size: int | None = None,
+        control_fusion: str | None = "cross",
         control_pretrained: bool | None = True,
     ):
         super().__init__()
@@ -128,6 +128,7 @@ class Switti(nn.Module):
         self.control_encoder_type = control_encoder_type
         self.control_pretrained = control_pretrained
         self.control_context_dim = control_context_dim if control_encoder_type is not None else None
+        self.control_fusion = control_fusion
 
         if control_encoder_type is not None:
             self.control_encoder = ControlEncoder(
@@ -158,6 +159,7 @@ class Switti(nn.Module):
                     qk_norm=attn_l2_norm,
                     context_dim=self.context_dim,
                     control_context_dim=self.control_context_dim,
+                    control_fusion=self.control_fusion,
                     use_swiglu_ffn=use_swiglu_ffn,
                     norm_eps=norm_eps,
                     use_crop_cond=use_crop_cond,

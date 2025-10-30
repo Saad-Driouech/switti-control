@@ -348,17 +348,27 @@ class AdaLNSelfCrossAttn(nn.Module):
         qk_norm=False,
         context_dim=None,
         control_context_dim=None,   # dim for control tokens (image control)
+        control_fusion: str = "cross",  # "cross" (default) or "add"
         use_swiglu_ffn=False,
         norm_eps=1e-6,
         use_crop_cond=False,
     ):
+        """
+        control_fusion:
+          - "cross": use self.cross_attn_control (CrossAttention) 
+          - "add"  : project control tokens to embed_dim and add them to x
+                     (per-token if lengths match, else mean-pool and broadcast)
+        """
         super().__init__()
         assert attn_drop == 0.0
         assert qk_norm
+        assert control_fusion in ("cross", "add"), "control_fusion must be 'cross' or 'add'"
 
         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
         self.C, self.D = embed_dim, cond_dim
+        self.control_fusion = control_fusion
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
         self.attn = SelfAttention(
             block_idx=block_idx,
             embed_dim=embed_dim,
@@ -380,8 +390,8 @@ class AdaLNSelfCrossAttn(nn.Module):
         else:
             self.cross_attn = None
 
-        # Cross-attn: control context (image control) 
-        if control_context_dim:
+        # Cross-attn: control context (image control) - only created for "cross" fusion
+        if control_context_dim and self.control_fusion == "cross":
             self.cross_attn_control = CrossAttention(
                 embed_dim=embed_dim,
                 context_dim=control_context_dim,
@@ -392,6 +402,12 @@ class AdaLNSelfCrossAttn(nn.Module):
             )
         else:
             self.cross_attn_control = None
+
+        # If additive fusion, create a projection from control_dim -> embed_dim
+        if control_context_dim and self.control_fusion == "add":
+            self.control_proj = nn.Linear(control_context_dim, embed_dim)
+        else:
+            self.control_proj = None
 
         if use_swiglu_ffn:
             self.ffn = SwiGLUFFN(dim=embed_dim)
@@ -407,7 +423,7 @@ class AdaLNSelfCrossAttn(nn.Module):
         self.cross_attention_norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.cross_attention_norm2 = RMSNorm(embed_dim, eps=norm_eps)
         self.cross_attention_control_norm = (
-            RMSNorm(embed_dim, eps=norm_eps) if control_context_dim else None
+            RMSNorm(embed_dim, eps=norm_eps) if control_context_dim and self.control_fusion == "cross" else None
         )
         self.cross_attention_norm_text_input = RMSNorm(embed_dim, eps=norm_eps)
 
@@ -424,7 +440,7 @@ class AdaLNSelfCrossAttn(nn.Module):
         self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin)
 
         self.fused_add_norm_fn = None
-        
+
         self.use_crop_cond = use_crop_cond
         if use_crop_cond:
             self.crop_cond_scales = nn.Parameter(torch.zeros(1, cond_dim))
@@ -470,24 +486,52 @@ class AdaLNSelfCrossAttn(nn.Module):
                 )
             )
 
-        # Cross-attention to control context (image-control) 
-        if control_context is not None and self.cross_attn_control is not None:
+        # --- Image control fusion (two modes) ---
+        if control_context is not None:
+            # (optional) normalize control tokens
             normed_ctrl = (
                 self.attention_control_norm(control_context)
                 if self.attention_control_norm is not None
                 else control_context
             )
-            x = x + (
-                self.cross_attention_control_norm(
-                    self.cross_attn_control(
-                        self.cross_attention_norm1(x),  # queries use same norm
-                        normed_ctrl,
-                        context_attn_bias=control_context_attn_bias,
-                        freqs_cis=freqs_cis,
+
+            if self.control_fusion == "cross" and self.cross_attn_control is not None:
+                # Cross-attention fusion
+                x = x + (
+                    self.cross_attention_control_norm(
+                        self.cross_attn_control(
+                            self.cross_attention_norm1(x),
+                            normed_ctrl,
+                            context_attn_bias=control_context_attn_bias,
+                            freqs_cis=freqs_cis,
+                        )
                     )
                 )
-            )
-            
+
+            elif self.control_fusion == "add" and self.control_proj is not None:
+                # Additive fusion:
+                # project control tokens -> (B, Lc, C), then either:
+                #  - if Lc == L: per-token add
+                #  - else: mean-pool over Lc and broadcast-add
+                proj = self.control_proj(normed_ctrl)  # (B, Lc, C)
+
+                # ensure dtype alignment with x
+                proj = proj.type_as(x)
+
+                L_x = x.shape[1]
+                Lc = proj.shape[1]
+
+                if Lc == L_x:
+                    # direct per-token add
+                    x = x + proj
+                else:
+                    # fall back to pooled broadcast (simple and robust)
+                    pooled = proj.mean(dim=1, keepdim=True)  # (B,1,C)
+                    x = x + pooled  # broadcast to (B, L_x, C)
+            else:
+                # fallback: if control fusion requested but no module available, silently ignore
+                pass
+
         x = x + self.ffn_norm2(
             self.ffn(self.ffn_norm1(x).mul(scale2.add(1)).add(shift2))
         ).mul(gamma2)
