@@ -20,3 +20,6 @@ local_output*
 *.txt
 *.ipynb
 apex/
+*.sh
+*.o*
+tests/

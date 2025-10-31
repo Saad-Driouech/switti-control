@@ -35,6 +35,10 @@ def build_models(
     # pipeline args
     text_encoder_path="openai/clip-vit-large-patch14",
     text_encoder_2_path="laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+    control_encoder_type: str | None = None,
+    control_context_dim: int = 512,
+    control_fusion: str | None = "cross",
+    control_pretrained: bool | None = True,
 ) -> tuple[VQVAE, Switti]:
     heads = depth
     width = depth * 64
@@ -80,6 +84,10 @@ def build_models(
         use_swiglu_ffn=use_swiglu_ffn,
         use_ar=use_ar,
         use_crop_cond=use_crop_cond,
+        control_encoder_type=control_encoder_type,
+        control_context_dim=control_context_dim,
+        control_fusion=control_fusion,
+        control_pretrained=control_pretrained,
     ).to(device)
     
     switti_wo_ddp.init_weights(

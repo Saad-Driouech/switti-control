@@ -100,6 +100,12 @@ class Args(Tap):
     aln: float = 0.5  # the multiplier of ada_lin.w's initialization
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     drop_path_rate: float = 0  # dropout after residual in xattn
+
+    # Control encoder args
+    control_encoder_type: str | None = None  # "cnn", "vit", or None
+    control_context_dim: int = 512          # hidden dim of control tokens
+    control_fusion: str = "cross"           # "cross" or "add"
+    control_pretrained: bool = False        # whether to use pretrained control encoder
     
     # Optimization
     fp16: int = 0  # 1: using fp16, 2: bf16
@@ -380,5 +386,15 @@ def init_dist_and_get_args():
 
     tb_name = "tb_logs"
     args.tb_log_dir_path = os.path.join(args.local_out_dir_path, tb_name)
+
+    # Initialize control encoder args defaults if not provided
+    if not hasattr(args, "control_encoder_type"):
+        args.control_encoder_type = None
+    if not hasattr(args, "control_context_dim"):
+        args.control_context_dim = 512
+    if not hasattr(args, "control_fusion"):
+        args.control_fusion = "cross"
+    if not hasattr(args, "control_pretrained"):
+        args.control_pretrained = False
 
     return args

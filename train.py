@@ -69,7 +69,15 @@ def build_everything(args: arg_util.Args):
         dpr=args.drop_path_rate,
         use_swiglu_ffn=args.use_swiglu_ffn,
         use_crop_cond=args.use_crop_cond,
+        control_encoder_type=args.control_encoder_type,
+        control_context_dim=args.control_context_dim,
+        control_fusion=args.control_fusion,
+        control_pretrained=args.control_pretrained,
     )
+
+    print(f"[CONTROL] Encoder type={args.control_encoder_type}, "
+      f"fusion={args.control_fusion}, pretrained={args.control_pretrained}")
+    
     # Load VAE and Switti checkpoints
     if args.vae_ckpt is None:
         args.vae_ckpt = DEFAULT_VAE_CKPT
