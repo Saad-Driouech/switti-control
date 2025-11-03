@@ -8,6 +8,9 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
+import cv2
+import numpy as np
+
 
 def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
     return x.add(x).add_(-1)
@@ -77,10 +80,60 @@ class COCODataset(Dataset):
             sample = self.transform(sample)
 
         return sample, self.captions[os.path.basename(sample_path)]
+    
+class ControlDataset(torch.utils.data.Dataset):
+    """
+    Wraps an existing dataset (e.g. COCODataset) to add control images.
+    Returns (image, control_image, caption)
+    """
+    def __init__(self, base_dataset, control_type: str = "edges"):
+        self.base = base_dataset
+        self.control_type = control_type
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        image, caption = self.base[idx]
+        control = self.make_control_image(image)
+        return image, control, caption
+
+    def make_control_image(self, image):
+        # convert tensor [C,H,W] → numpy [H,W,C] in 0–255
+        if isinstance(image, torch.Tensor):
+            img_np = (image.permute(1, 2, 0).numpy() * 127.5 + 127.5).astype(np.uint8)
+        else:
+            img_np = np.array(image)
+
+        if self.control_type == "edges":
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            control = np.stack([edges] * 3, axis=-1)
+        elif self.control_type == "gray":
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            control = np.stack([gray] * 3, axis=-1)
+        elif self.control_type == "same":
+            control = img_np
+        else:
+            raise ValueError(f"Unknown control_type: {self.control_type}")
+
+        control_tensor = torch.from_numpy(control).permute(2, 0, 1).float() / 255.0
+        control_tensor = normalize_01_into_pm1(control_tensor)
+        return control_tensor
 
 
 def coco_collate_fn(batch):
-    return torch.stack([x[0] for x in batch]), [x[1] for x in batch]
+    if len(batch[0]) == 2:
+        # (image, caption)
+        images = torch.stack([x[0] for x in batch])
+        captions = [x[1] for x in batch]
+        return images, None, captions  # control_image=None
+    else:
+        # (image, control, caption)
+        images = torch.stack([x[0] for x in batch])
+        controls = torch.stack([x[1] for x in batch])
+        captions = [x[2] for x in batch]
+        return images, controls, captions
 
 
 def build_dataset(
@@ -88,6 +141,8 @@ def build_dataset(
     final_reso: int,
     hflip=False,
     mid_reso=1.125,
+    use_control=False,
+    control_type="edges",
 ):
     # build augmentations
     # first resize to mid_reso, then crop to final_reso
@@ -112,6 +167,11 @@ def build_dataset(
         transform=train_aug,
         max_cnt=None,
     )
+
+    if use_control:
+        train_set = ControlDataset(train_set, control_type=control_type)
+        print(f"[Dataset] Using control dataset (type={control_type})")
+
     print(f"[Dataset] {len(train_set)=}")
     print_aug(train_aug, "[train]")
 
