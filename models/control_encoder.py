@@ -106,6 +106,9 @@ class ViTControlEncoder(nn.Module):
         B, C, H, W = x.shape
         if self.pretrained and self.vit is not None:
             # Pretrained ViT expects 224x224 usually
+            expected_size = self.vit.patch_embed.img_size[0]
+            if H != expected_size or W != expected_size:
+                x = F.interpolate(x, size=(expected_size, expected_size), mode="bicubic", align_corners=False)
             feats = self.vit.forward_features(x)  # (B, L, vit_dim)
             return self.proj(feats)  # (B, L_ctrl, out_dim)
 
