@@ -100,9 +100,20 @@ class SwittiTrainer(object):
         tb_lg: TensorboardLogger
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # forward
-        self.switti.train()
+        train_control_only = getattr(self.args, "freeze_switti_backbone", False)
+        if train_control_only:
+            self.switti.eval()  # freeze Switti backbone layers
+            self.switti_wo_ddp.control_encoder.train()  # only train control encoder
+        else:
+            self.switti.train()
         for accum_iter in range(self.grad_accum):
-            image, prompt = next(self.dataloader)
+            image, control_image, prompt = next(self.dataloader)
+
+            if control_image is not None:
+                control_image = control_image.to(self.device, non_blocking=True)
+                control_image = F.interpolate(
+                    control_image, size=(self.resos[-1], self.resos[-1]), mode="bicubic"
+    )
 
             inp_B3HW = image.to(self.device, non_blocking=True)
             inp_B3HW = F.interpolate(
@@ -134,6 +145,7 @@ class SwittiTrainer(object):
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
                     prompt_attn_bias=prompt_attn_bias,
+                    control_image=control_image,
                 )
                 loss = self.train_loss(logits_BLV.view(-1, V),
                                        gt_BL.view(-1),
@@ -159,6 +171,7 @@ class SwittiTrainer(object):
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
                     prompt_attn_bias=prompt_attn_bias,
+                    control_image=control_image,
                 )
 
             # Compute cluster usage

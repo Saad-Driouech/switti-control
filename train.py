@@ -78,6 +78,15 @@ def build_everything(args: arg_util.Args):
     print(f"[CONTROL] Encoder type={args.control_encoder_type}, "
       f"fusion={args.control_fusion}, pretrained={args.control_pretrained}")
     
+    # === Optional: Freeze Switti backbone (train control encoder only) ===
+    if getattr(args, "freeze_switti_backbone", False):
+        print("[INFO] Freezing Switti backbone parameters...")
+        for name, param in switti_wo_ddp.named_parameters():
+            if "ada_lin" in name or "control_encoder" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+    
     # Load VAE and Switti checkpoints
     if args.vae_ckpt is None:
         args.vae_ckpt = DEFAULT_VAE_CKPT

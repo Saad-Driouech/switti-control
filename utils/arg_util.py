@@ -106,6 +106,8 @@ class Args(Tap):
     control_context_dim: int = 512          # hidden dim of control tokens
     control_fusion: str = "cross"           # "cross" or "add"
     control_pretrained: bool = False        # whether to use pretrained control encoder
+    freeze_switti_backbone: bool = False    # whether to freeze switti backbone and train the encoder only
+    control_type: str | None = None
     
     # Optimization
     fp16: int = 0  # 1: using fp16, 2: bf16
@@ -396,5 +398,9 @@ def init_dist_and_get_args():
         args.control_fusion = "cross"
     if not hasattr(args, "control_pretrained"):
         args.control_pretrained = False
+    if not hasattr(args, "freeze_switti_backbone"):
+        args.freeze_switti_backbone = False
+    if not hasattr(args, "control_type"):
+        args.control_type = False
 
     return args
