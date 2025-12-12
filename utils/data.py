@@ -1,3 +1,5 @@
+# utils/data.py
+
 import csv
 import os
 
@@ -147,7 +149,7 @@ class ControlDataset(Dataset):
             if control_root:
                 self.control_roots[ctype] = os.path.join(control_root, ctype)
             else:
-                self.control_roots[ctype] = os.path.join(self.base.root_dir, "control", ctype)
+                self.control_roots[ctype] = os.path.join(self.base.root_dir, "train_control", ctype)
 
     def __len__(self):
         return len(self.base)
