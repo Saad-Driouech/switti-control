@@ -1,5 +1,11 @@
 import math
 from typing import List, Optional, Tuple, Union
+import json
+import os
+import random
+from collections import defaultdict
+from PIL import Image
+from PIL.Image import Image as PILImage
 
 import torch
 import torch.nn as nn
@@ -7,6 +13,7 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision.utils import make_grid
+import torchvision.transforms.functional as TF
 
 import dist
 from models import Switti, VQVAE
@@ -44,6 +51,86 @@ EVAL_PROMPTS = [
     "a close-up of a blue dragonfly on a daffodil",
     "A close-up of two beetles wearing karate uniforms and fighting, jumping over a waterfall."
 ]
+
+def generate_logging_prompts_captions(
+    missing_files_path: str,
+    captions_json_path: str,
+    control_path: str | None,
+    control_types: list[str] | None,
+    num_select: int = 10,
+) -> tuple[list[str], list[str], dict[str, list[Image.Image] | None]]:
+    """
+    Select files from missing files list, fetch captions from COCO captions JSON,
+    and load control images for each control type.
+
+    Returns:
+        selected_filenames: list of selected filenames (str)
+        selected_captions: list of corresponding captions (str)
+        control_dict_batch: dict mapping control_type -> list of PIL images or None
+    """
+
+    # Load missing filenames
+    with open(missing_files_path, 'r') as f:
+        missing_filenames = [line.strip() for line in f if line.strip()]
+
+    # Load captions json
+    with open(captions_json_path, 'r') as f:
+        captions_data = json.load(f)
+
+    # Map image_id -> file_name and vice versa
+    id_to_file = {img['id']: img['file_name'] for img in captions_data['images']}
+    file_to_id = {v: k for k, v in id_to_file.items()}
+
+    # Map image_id -> list of captions (usually multiple captions per image)
+    id_to_captions = defaultdict(list)
+    for ann in captions_data['annotations']:
+        id_to_captions[ann['image_id']].append(ann['caption'])
+
+    # Filter captions for missing files only
+    filtered_items = []
+    for fname in missing_filenames:
+        image_id = file_to_id.get(fname)
+        fname = fname.replace(".jpg", ".png")
+        if image_id is None:
+            continue
+        caps = id_to_captions.get(image_id, [])
+        if not caps:
+            continue
+        # Pick the first caption or join all captions
+        caption = caps[0] if caps else ""
+        filtered_items.append((fname, caption))
+
+    # Optional: Stratify selection by simple heuristics or categories if available
+    # Here, randomly sample num_select or less from filtered list
+    if len(filtered_items) > num_select:
+        selected_items = random.sample(filtered_items, num_select)
+    else:
+        selected_items = filtered_items
+
+    selected_filenames = [x[0] for x in selected_items]
+    selected_captions = [x[1] for x in selected_items]
+
+    print(f"[Trainer] Selected filenames: {selected_filenames}")
+
+    # Load control images if control_path and control_types are provided
+    control_dict_batch = None
+    if control_path is not None and control_types:
+        control_dict_batch = {ctrl: [] for ctrl in control_types}
+        for fname in selected_filenames:
+            for ctrl in control_types:
+                ctrl_fp = os.path.join(control_path, ctrl, fname)
+                if os.path.exists(ctrl_fp):
+                    try:
+                        img = Image.open(ctrl_fp).convert("RGB")
+                    except Exception as e:
+                        print(f"[Warning] Failed to open control image {ctrl_fp}: {e}")
+                        img = None
+                else:
+                    img = None
+                control_dict_batch[ctrl].append(img)
+
+    # Return
+    return selected_captions, control_dict_batch
 
 
 class SwittiTrainer(object):
@@ -93,6 +180,153 @@ class SwittiTrainer(object):
         self.device = device
         self.grad_accum = args.grad_accum
         self.embed_noise_std = args.embed_noise_std
+        self.log_prompts, self.log_control_dict = generate_logging_prompts_captions(
+            missing_files_path=os.path.join(args.data_path, "log_files.txt"),
+            captions_json_path=os.path.join(args.data_path, "annotations", "captions_val2014.json"),
+            control_path=os.path.join(args.data_path, "val_control"),
+            control_types=args.control_types,
+        )
+        print(f"[Trainer] logging prompts {self.log_prompts}")
+        print(f"[Trainer] logging control dict {self.log_control_dict}")
+        param = next(self.switti.parameters()).to(self.device)
+        self.model_dtype = param.dtype
+
+    # build small control dict for pipe visualization (use up to N images)
+    def _build_ctrl_for_pipe(self, ctrl_dict, n):
+        if ctrl_dict is None:
+            return None
+        sub = {}
+        for k, v in ctrl_dict.items():
+            if v is None:
+                sub[k] = None
+            else:
+                # v is (B,3,H,W)
+                sub[k] = v[:n].cpu()
+        return sub
+
+    def _prepare_vis_image(self, item):
+        if item is None:
+            return None
+
+        # PIL → tensor [0,1]
+        if isinstance(item, PILImage):
+            t = TF.to_tensor(item).float()
+            return t
+
+        # Tensor
+        if torch.is_tensor(item):
+            t = item.detach().cpu().float()
+
+            # Remove batch dim if present
+            if t.ndim == 4 and t.size(0) == 1:
+                t = t.squeeze(0)
+
+            # Must be CHW now
+            if t.ndim != 3:
+                raise ValueError(f"Expected CHW tensor, got {t.shape}")
+
+            # [-1,1] → [0,1]
+            if t.min() < 0:
+                t = (t + 1) * 0.5
+
+            return t.clamp(0, 1)
+
+        raise ValueError(f"Unsupported type in _prepare_vis_image: {type(item)}")
+
+    def _resize_and_crop_for_vis(self, t):
+        # t: (3,H,W) in [0,1]
+        mid_reso = round(self.args.data_load_reso * self.args.mid_reso)   
+        t = TF.resize(t, mid_reso, antialias=True)
+        t = TF.center_crop(t, (self.args.data_load_reso, self.args.data_load_reso))
+        return t.clamp(0, 1)
+
+    def _combine_side_by_side(self, left, right):
+        if left is None:
+            return right
+        if right is None:
+            return left
+
+        # left, right: (3,H,W)
+        H = max(left.shape[1], right.shape[1])
+
+        if left.shape[1] != H:
+            left = F.pad(left, (0,0,0, H - left.shape[1]))
+        if right.shape[1] != H:
+            right = F.pad(right, (0,0,0, H - right.shape[1]))
+
+        return torch.cat([left, right], dim=2)
+
+    def _control_grids_for_tb(self, control_dict, n_show=None):
+        """
+        Converts control images (tensor batch or PIL list) into
+        visualization grids that match the size & layout of generated images.
+        
+        Returns dict[type] → grid tensor (3,H,W).
+        """
+        if control_dict is None:
+            return None
+
+        out = {}
+
+        for ctrl_type, value in control_dict.items():
+            if value is None:
+                continue
+
+            # Normalize input into list
+            if torch.is_tensor(value):
+                items = [value[i] for i in range(min(value.shape[0], n_show or value.shape[0]))]
+            elif isinstance(value, list):
+                items = value[:n_show] if n_show is not None else value
+            else:
+                print(f"[Warning] unexpected control type for {ctrl_type}: {type(value)}")
+                continue
+
+            # Convert each element to tensor (3,H,W) in [0,1]
+            tensors = []
+            for itm in items:
+                if itm is None:
+                    continue
+                t = self._prepare_vis_image(itm)
+                t = self._resize_and_crop_for_vis(t)
+                tensors.append(t)
+
+            if len(tensors) == 0:
+                continue
+
+            imgs = torch.stack(tensors, dim=0)   # (B,3,H,W)
+            grid = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+            out[ctrl_type] = grid
+
+        return out
+
+    def _log_pipe_outputs(self, tb_lg, tag_prefix, imgs, control_dict, g_it, n_show=None):
+        """
+        Logs ONE PANEL per control type:
+            | CONTROL GRID | GENERATED GRID |
+        Both grids have equal size and are perfectly aligned.
+        """
+        # Generated grid already (3,H,W) — but make sure it's float32 [0,1]
+        gen_grid = imgs.detach().cpu().float()
+        gen_grid = gen_grid.clamp(0,1)
+
+        # Build control grids
+        control_grids = self._control_grids_for_tb(control_dict, n_show)
+
+        # No control → only log generated
+        if not control_grids:
+            tb_lg.log_image(f"{tag_prefix}_generated", gen_grid, step=g_it)
+            return
+
+        # For each control type, build side-by-side panel
+        for ctrl_type, ctrl_grid in control_grids.items():
+            ctrl_grid = ctrl_grid.float().clamp(0,1)
+            combined = self._combine_side_by_side(ctrl_grid, gen_grid)
+
+            tb_lg.log_image(
+                f"{tag_prefix}_{ctrl_type}_control_and_generated",
+                combined,
+                step=g_it,
+            )
 
     def train_step(
         self,
@@ -101,19 +335,35 @@ class SwittiTrainer(object):
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # forward
         train_control_only = getattr(self.args, "freeze_switti_backbone", False)
-        if train_control_only:
-            self.switti.eval()  # freeze Switti backbone layers
-            self.switti_wo_ddp.control_encoder.train()  # only train control encoder
-        else:
-            self.switti.train()
-        for accum_iter in range(self.grad_accum):
-            image, control_image, prompt = next(self.dataloader)
 
-            if control_image is not None:
-                control_image = control_image.to(self.device, non_blocking=True)
-                control_image = F.interpolate(
-                    control_image, size=(self.resos[-1], self.resos[-1]), mode="bicubic"
-    )
+        self.switti.train()
+
+        if train_control_only:
+            # Use the unwrapped module for attribute checks and direct submodule .train()
+            if hasattr(self.switti_wo_ddp, "control_encoder") and self.switti_wo_ddp.control_encoder is not None:
+                # put the unwrapped control encoder into train mode (important when wrapped)
+                self.switti_wo_ddp.control_encoder.train()
+
+
+        for accum_iter in range(self.grad_accum):
+            batch = next(self.dataloader)
+            if len(batch) == 3:
+                image, prompt, orig_size = batch
+                control_dict = None
+            else:
+                image, prompt, control_dict, orig_size = batch
+
+            batch_height = [h for (w, h) in orig_size]
+            batch_width = [w for (w, h) in orig_size]
+
+            if control_dict is not None:
+                processed = {}
+                for k, v in control_dict.items():
+                    if v is None: 
+                        processed[k] = None
+                    else:
+                        processed[k] = v.to(self.device, non_blocking=True).to(self.model_dtype)
+                control_dict = processed
 
             inp_B3HW = image.to(self.device, non_blocking=True)
             inp_B3HW = F.interpolate(
@@ -145,7 +395,9 @@ class SwittiTrainer(object):
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
                     prompt_attn_bias=prompt_attn_bias,
-                    control_image=control_image,
+                    batch_height=batch_height,
+                    batch_width=batch_width,
+                    control_dict=control_dict
                 )
                 loss = self.train_loss(logits_BLV.view(-1, V),
                                        gt_BL.view(-1),
@@ -171,7 +423,9 @@ class SwittiTrainer(object):
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
                     prompt_attn_bias=prompt_attn_bias,
-                    control_image=control_image,
+                    batch_height=batch_height,
+                    batch_width=batch_width,
+                    control_dict=control_dict
                 )
 
             # Compute cluster usage
@@ -212,43 +466,62 @@ class SwittiTrainer(object):
             if g_it % self.args.log_images_iters == 0:
                 with FSDP.summon_full_params(self.switti, writeback=False):
                     torch.cuda.empty_cache()
-                    for cfg in [0, 6]:
+                    for cfg in [6]: # SAAD: add o
                         subprompt = prompt[:16]
+                        n_show = min(len(subprompt), next(iter(control_dict.values())).shape[0]) if control_dict else len(subprompt)
+                        ctrl_for_pipe = self._build_ctrl_for_pipe(control_dict, n_show)
                         imgs = self.pipe(subprompt,
                                          cfg=cfg,
                                          top_k=self.args.top_k,
                                          top_p=self.args.top_p,
                                          return_pil=False,
+                                         mid_reso=self.args.mid_reso,
+                                         control_dict=ctrl_for_pipe,
                                          )
                         imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
-                        tb_lg.log_image(
-                            f"train_imgs_top_k={self.args.top_k}_top_p={self.args.top_p}_cfg={cfg}",
-                            imgs,
-                            step=g_it,
-                            )
+                        self._log_pipe_outputs(
+                            tb_lg,
+                            tag_prefix=f"train_topk={self.args.top_k}_topp={self.args.top_p}_cfg={cfg}",
+                            imgs=imgs,
+                            control_dict=ctrl_for_pipe,
+                            g_it=g_it,
+                            n_show=n_show,
+                        )
 
                         imgs = self.pipe(
-                            EVAL_PROMPTS,
+                            prompt=self.log_prompts,
                             cfg=cfg,
                             top_k=self.args.top_k,
                             top_p=self.args.top_p,
                             return_pil=False,
+                            mid_reso=self.args.mid_reso,
+                            control_dict=self.log_control_dict,
                         )
                         imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
-                        tb_lg.log_image(
-                            f"eval_imgs_topk={self.args.top_k}_top={self.args.top_p}_cfg={cfg}",
-                            imgs,
-                            step=g_it,
-                            )
+                        self._log_pipe_outputs(
+                            tb_lg,
+                            tag_prefix=f"eval_topk={self.args.top_k}_topp={self.args.top_p}_cfg={cfg}",
+                            imgs=imgs,
+                            control_dict=self.log_control_dict,
+                            g_it=g_it,
+                        )
 
-                        imgs = self.pipe(
-                            EVAL_PROMPTS,
-                            top_k=1,
-                            cfg=cfg,
-                            return_pil=False,
-                        )
-                        imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
-                        tb_lg.log_image(f"eval_imgs_topk_1_cfg{cfg}", imgs, step=g_it)
+                        # imgs = self.pipe(
+                        #     prompt=self.log_prompts,
+                        #     top_k=1,
+                        #     cfg=cfg,
+                        #     return_pil=False,
+                        #     mid_reso=self.args.mid_reso,
+                        #     control_dict=self.log_control_dict,
+                        # )
+                        # imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+                        # self._log_pipe_outputs(
+                        #     tb_lg,
+                        #     tag_prefix=f"eval_topk1_cfg={cfg}",
+                        #     imgs=imgs,
+                        #     control_dict=self.log_control_dict,
+                        #     g_it=g_it,
+                        # )
                         del imgs
 
             if dist.is_master():
