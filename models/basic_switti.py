@@ -422,10 +422,12 @@ class AdaLNSelfCrossAttn(nn.Module):
         self.self_attention_norm2 = RMSNorm(embed_dim, eps=norm_eps)
         self.cross_attention_norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.cross_attention_norm2 = RMSNorm(embed_dim, eps=norm_eps)
-        self.cross_attention_control_norm = (
+        self.cross_attention_control_norm1 = (
             RMSNorm(embed_dim, eps=norm_eps) if control_context_dim and self.control_fusion == "cross" else None
         )
-        self.cross_attention_norm_text_input = RMSNorm(embed_dim, eps=norm_eps)
+        self.cross_attention_control_norm2 = (
+            RMSNorm(embed_dim, eps=norm_eps) if control_context_dim and self.control_fusion == "cross" else None
+        )
 
         self.ffn_norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(embed_dim, eps=norm_eps)
@@ -454,8 +456,8 @@ class AdaLNSelfCrossAttn(nn.Module):
         crop_cond=None,
         context=None,
         context_attn_bias=None,
-        control_context=None,
-        control_context_attn_bias=None,
+        control_contexts=None,
+        control_context_attn_biases=None,
         freqs_cis=None,
     ):  # C: embed_dim, D: cond_dim
         
@@ -487,50 +489,51 @@ class AdaLNSelfCrossAttn(nn.Module):
             )
 
         # --- Image control fusion (two modes) ---
-        if control_context is not None:
-            # (optional) normalize control tokens
-            normed_ctrl = (
-                self.attention_control_norm(control_context)
-                if self.attention_control_norm is not None
-                else control_context
-            )
+        if control_contexts is not None:
+            for ctrl_type, control_context in control_contexts.items():
+                # (optional) normalize control tokens
+                normed_ctrl = (
+                    self.attention_control_norm(control_context)
+                    if self.attention_control_norm is not None
+                    else control_context
+                ).to(x.dtype)
 
-            if self.control_fusion == "cross" and self.cross_attn_control is not None:
-                # Cross-attention fusion
-                x = x + (
-                    self.cross_attention_control_norm(
+                if self.control_fusion == "cross" and self.cross_attn_control is not None:
+                    # Cross-attention fusion
+                    control_attn_bias = None
+                    if control_context_attn_biases is not None:
+                        control_attn_bias = control_context_attn_biases.get(ctrl_type, None)
+                    
+                    if control_attn_bias is None:
+                        control_attn_bias = torch.ones(
+                            (x.shape[0], control_context.shape[1]),
+                            dtype=torch.bool,
+                            device=x.device
+                        )
+
+                    x = x + self.cross_attention_control_norm2(
                         self.cross_attn_control(
-                            self.cross_attention_norm1(x),
+                            self.cross_attention_control_norm1(x),
                             normed_ctrl,
-                            context_attn_bias=control_context_attn_bias,
+                            context_attn_bias=control_attn_bias,
                             freqs_cis=freqs_cis,
                         )
                     )
-                )
+                elif self.control_fusion == "add" and self.control_proj is not None:
+                    # Additive fusion:
+                    proj = self.control_proj(normed_ctrl).type_as(x)
 
-            elif self.control_fusion == "add" and self.control_proj is not None:
-                # Additive fusion:
-                # project control tokens -> (B, Lc, C), then either:
-                #  - if Lc == L: per-token add
-                #  - else: mean-pool over Lc and broadcast-add
-                proj = self.control_proj(normed_ctrl)  # (B, Lc, C)
+                    L_x = x.shape[1]
+                    Lc = proj.shape[1]
 
-                # ensure dtype alignment with x
-                proj = proj.type_as(x)
-
-                L_x = x.shape[1]
-                Lc = proj.shape[1]
-
-                if Lc == L_x:
-                    # direct per-token add
-                    x = x + proj
+                    if Lc == L_x:
+                        x = x + proj
+                    else:
+                        pooled = proj.mean(dim=1, keepdim=True)
+                        x = x + pooled
                 else:
-                    # fall back to pooled broadcast (simple and robust)
-                    pooled = proj.mean(dim=1, keepdim=True)  # (B,1,C)
-                    x = x + pooled  # broadcast to (B, L_x, C)
-            else:
-                # fallback: if control fusion requested but no module available, silently ignore
-                pass
+                    # fallback silently ignore if fusion requested but no module available
+                    pass
 
         x = x + self.ffn_norm2(
             self.ffn(self.ffn_norm1(x).mul(scale2.add(1)).add(shift2))
