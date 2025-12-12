@@ -1,3 +1,5 @@
+# utils/arg_util.py
+
 import json
 import os
 import random
@@ -5,7 +7,7 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import numpy as np
 import torch
@@ -15,11 +17,6 @@ from utils import misc
 try:
     from tap import Tap
 except ImportError as e:
-    print(
-        f"`>>>>>>>> from tap import Tap` failed, please run:      pip3 install typed-argument-parser     <<<<<<<<",
-        file=sys.stderr,
-        flush=True,
-    )
     print(
         f"`>>>>>>>> from tap import Tap` failed, please run:      pip3 install typed-argument-parser     <<<<<<<<",
         file=sys.stderr,
@@ -36,11 +33,24 @@ RESOLUTION_PATCH_NUMS_MAPPING = {
     1024: "1_2_3_4_5_7_9_12_16_21_27_36_48_64",
 }
 
+
+def parse_control_types(value: str) -> Union[List[str], None]:
+    """Parse control_types argument which can be a string or comma-separated list."""
+    if value is None or value.lower() == 'none':
+        return None
+    # If contains comma, split into list
+    if ',' in value:
+        return [s.strip() for s in value.split(',')]
+    # Otherwise return a list with a single value
+    return [value]
+
+
 class Args(Tap):
     data_path: str = "path_to_your_dataset"
     text_encoder_path: str = "openai/clip-vit-large-patch14"
     text_encoder_2_path: str = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
     vae_ckpt: str | None = None
+    switti_ckpt: str | None = None
     exp_name: str = "experiment_name"
 
     # eval sampling args
@@ -106,8 +116,8 @@ class Args(Tap):
     control_context_dim: int = 512          # hidden dim of control tokens
     control_fusion: str = "cross"           # "cross" or "add"
     control_pretrained: bool = False        # whether to use pretrained control encoder
-    freeze_switti_backbone: bool = False    # whether to freeze switti backbone and train the encoder only
-    control_type: str | None = None
+    freeze_switti_backbone: bool = True    # whether to freeze switti backbone and train the encoder only
+    control_types: Union[str, List[str], None] = None  # None, single value, or comma separated string which will be later processed into a list
     
     # Optimization
     fp16: int = 0  # 1: using fp16, 2: bf16
@@ -217,6 +227,10 @@ class Args(Tap):
     tf32: bool = True  # whether to use TensorFloat32
     device: str = "cpu"  # [automatically set; don't specify this]
     seed: int = None  # seed
+
+    def configure(self) -> None:
+        """Configure argument parsing for Union types."""
+        self.add_argument('--control_types', type=parse_control_types)
 
     def seed_everything(self, benchmark: bool):
         torch.backends.cudnn.enabled = True
@@ -372,18 +386,23 @@ def init_dist_and_get_args():
 
     # update args: data loading
     args.device = dist.get_device()
-    args.pn = RESOLUTION_PATCH_NUMS_MAPPING.get(int(args.pn), args.pn)
+    try:
+        pn_val = int(args.pn)
+        args.pn = RESOLUTION_PATCH_NUMS_MAPPING.get(pn_val, args.pn)
+    except ValueError:
+        # args.pn is already a patch string, leave it alone
+        pass
     args.patch_nums = tuple(map(int, args.pn.replace("-", "_").split("_")))
     args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
     args.data_load_reso = max(args.resos)
 
     # update args: bs and lr
-    bs_per_gpu = round(args.bs / dist.get_world_size())
+    bs_per_gpu = round(args.bs / dist.get_world_size() / args.grad_accum)
     args.batch_size = bs_per_gpu
-    args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size()
+    args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size() * args.grad_accum
     args.workers = min(max(0, args.workers), args.batch_size)
 
-    args.tlr = args.tblr
+    args.tlr = args.tlr if args.tlr is not None else args.tblr * (args.bs / 256)
     args.twde = args.twde or args.twd
 
     tb_name = "tb_logs"
@@ -400,7 +419,16 @@ def init_dist_and_get_args():
         args.control_pretrained = False
     if not hasattr(args, "freeze_switti_backbone"):
         args.freeze_switti_backbone = False
-    if not hasattr(args, "control_type"):
-        args.control_type = False
+    if not hasattr(args, "control_types"):
+        args.control_types = None
+    
+    # Parse control_types if it's a string
+    if args.control_types is not None and isinstance(args.control_types, str):
+        args.control_types = parse_control_types(args.control_types)
+
+    assert (
+        args.control_types is None
+        or (isinstance(args.control_types, list) and all(isinstance(x, str) for x in args.control_types))
+    ), f"control_types must be None or list[str], but got: {args.control_types!r}"
 
     return args
