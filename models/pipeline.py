@@ -1,6 +1,9 @@
 import torch
 from torchvision.transforms import ToPILImage
 from PIL.Image import Image as PILImage
+import numpy as np
+from torchvision.transforms import functional as TF
+import torch.nn.functional as F
 
 from models.vqvae import VQVAEHF
 from models.clip import FrozenCLIPEmbedder
@@ -27,6 +30,9 @@ class SwittiPipeline:
         self.vae.eval()
 
         self.device = device
+
+        param = next(self.switti.parameters()).to(self.device)
+        self.model_dtype = param.dtype
 
     @classmethod
     def from_pretrained(cls,
@@ -85,6 +91,39 @@ class SwittiPipeline:
 
         return prompt_embeds, pooled_prompt_embeds, attn_bias
 
+    def _preprocess_control_image(self, img, mid_reso):
+        # 1. Standardize Input to Tensor (B, C, H, W) in [0, 1]
+        if isinstance(img, PILImage):
+            img = torch.tensor(
+                (np.array(img.convert("RGB")) / 255.0),
+                dtype=self.model_dtype,
+                device=self.device,
+            ).permute(2, 0, 1).unsqueeze(0)
+        elif isinstance(img, torch.Tensor):
+            # Handle Tensor input
+            if img.ndim == 3:
+                img = img.unsqueeze(0)
+            if img.shape[1] == 1:
+                img = img.repeat(1, 3, 1, 1)
+            img = img.to(device=self.device, dtype=self.model_dtype)
+            
+            # Optional: Sanity check if user passed [0, 255] tensor
+            if img.max() > 1.0:
+                 img = img / 255.0
+        
+        # 2. Resize to mid-res
+        mid_reso_px = round(TRAIN_IMAGE_SIZE[0] * mid_reso)
+        img = F.interpolate(img, size=mid_reso_px, mode="bicubic", align_corners=False)
+
+        # 3. Center crop to final
+        img = TF.center_crop(img, TRAIN_IMAGE_SIZE)
+
+        # 4. Normalize to [-1, 1]
+        img = img.add(img).add_(-1)
+
+        return img
+
+
     @torch.inference_mode()
     def __call__(
         self,
@@ -100,6 +139,8 @@ class SwittiPipeline:
         turn_off_cfg_start_si: int = 10,
         turn_on_cfg_start_si: int = 0,
         last_scale_temp: None | float = None,
+        mid_reso: float = 1.125,
+        control_dict: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor | list[PILImage]:
         """
         only used for inference, on autoregressive mode
@@ -123,6 +164,78 @@ class SwittiPipeline:
             rng = switti.rng
 
         context, cond_vector, context_attn_bias = self.encode_prompt(prompt, null_prompt)
+
+        # --------------------------------------------------
+        # Control Image Encoding (robust version)
+        # --------------------------------------------------
+        control_contexts = None
+        control_context_attn_biases = None
+
+        if control_dict is not None and hasattr(self.switti, "control_encoder"):
+
+            control_contexts = {}
+            control_context_attn_biases = {}
+
+            for ctrl_type, ctrl_input in control_dict.items():
+
+                if ctrl_input is None:
+                    continue
+
+                # ---- Normalize to list ----
+                if isinstance(ctrl_input, (list, tuple)):
+                    ctrl_list = list(ctrl_input)
+                else:
+                    # single PIL/tensor → list of length 1
+                    ctrl_list = [ctrl_input]
+
+                processed = []
+
+                for item in ctrl_list:
+                    proc = self._preprocess_control_image(item, mid_reso)
+                    processed.append(proc)
+
+                # ---- Concatenate into a batch ----
+                # If *all* items are None → skip
+                if all(p is None for p in processed):
+                    continue
+
+                # Replace None with zeros
+                final = []
+                for p in processed:
+                    if p is None:
+                        # fill with zeros; shape matches first valid
+                        shape = next(v.shape for v in processed if v is not None)
+                        final.append(torch.zeros(shape, device=self.device, dtype=self.model_dtype))
+                    else:
+                        final.append(p)
+
+                # stack → (B,3,H,W)
+                ctrl_batch = torch.cat(final, dim=0)
+
+                assert ctrl_batch.ndim == 4 and ctrl_batch.shape[1] == 3, \
+                    f"ctrl_batch must be BCHW with 3 channels, got {tuple(ctrl_batch.shape)}"
+
+                # # Preprocess to correct resolution (B,3,H,W)
+                # ctrl_batch = torch.nn.functional.interpolate(
+                #     ctrl_batch,
+                #     size=TRAIN_IMAGE_SIZE,
+                #     mode="bicubic",
+                #     align_corners=False,
+                # )
+
+                # Encode control tokens → (B, Lc, ctrl_dim)
+                ctx = self.switti.control_encoder(ctrl_batch)
+                # --- Repeat control contexts for CFG ---
+                ctx = ctx.repeat(2, 1, 1)
+
+                control_contexts[ctrl_type] = ctx
+
+                # attention mask: all tokens valid
+                Bc, Lc, _ = ctx.shape
+                control_context_attn_biases[ctrl_type] = torch.ones(
+                    (Bc, Lc), dtype=torch.bool, device=self.device
+                )
+
 
         B = context.shape[0] // 2
 
@@ -172,6 +285,8 @@ class SwittiPipeline:
                 cond_BD = cond_BD[:B]
                 if crop_cond is not None:
                     crop_cond = crop_cond[:B]
+                if control_contexts is not None:
+                    control_contexts = {k: v[:B] for k, v in control_contexts.items()}
                 for b in switti.blocks:
                     if b.attn.caching and b.attn.cached_k is not None:
                         b.attn.cached_k = b.attn.cached_k[:B]
@@ -189,6 +304,8 @@ class SwittiPipeline:
                     attn_bias=None,
                     context=context,
                     context_attn_bias=context_attn_bias,
+                    control_contexts=control_contexts,
+                    control_context_attn_biases=control_context_attn_biases,
                     freqs_cis=freqs_cis,
                     crop_cond=crop_cond,
                 )
