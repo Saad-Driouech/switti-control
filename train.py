@@ -8,6 +8,7 @@ from trainer import SwittiTrainer
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.utils.data import DataLoader
+from typing import Iterable
 
 import dist
 from calculate_metrics import distributed_metrics_with_csv, to_PIL_image
@@ -20,9 +21,110 @@ from utils.lr_control import filter_params, lr_wd_annealing
 from utils.data import build_dataset, coco_collate_fn
 from utils.data_sampler import DistInfiniteBatchSampler
 from utils.fid_score_in_memory import calculate_fid
+from models.switti import SwittiHF
 
 
 DEFAULT_VAE_CKPT = "vae_ch160v4096z32.pth"
+
+def _clean_name_for_matching(name: str) -> str:
+    """
+    Remove common wrapper prefixes introduced by DDP/FSDP so matching is simpler.
+    Keep minimal transforms — this will handle common cases.
+    """
+    return (
+        name
+        .replace("_fsdp_wrapped_module.", "")
+        .replace("_fully_sharded_module.", "")
+        .replace("module.", "")
+    )
+
+def apply_control_only_freeze(
+    model: torch.nn.Module,
+    *,
+    freeze_control_backbone: bool = True,
+    verbose: bool = True,
+) -> None:
+    """
+    Freeze all Switti params except a conservative set required for image-control training.
+
+    This function:
+      - Works when called on the unwrapped Switti (recommended), and will also
+        tolerate being called on a wrapped FSDP/DDP module (it strips common prefixes).
+      - Optionally freezes the control encoder backbone (according to `freeze_control_backbone`).
+        The control-backbone parameter name(s) are matched using `control_backbone_name_tokens`.
+      - Keeps projection heads (proj) trainable.
+
+    Kept (trainable) by default:
+      - Entire control_encoder (except backbone if freeze_control_backbone=True)
+      - control projection layers (e.g. *.proj)
+      - control fusion modules inside blocks:
+          - .cross_attn_control
+          - .cross_attention_control_norm
+          - .attention_control_norm
+          - .control_proj
+      - crop_embed / crop_proj (if present)
+
+    Everything else is frozen.
+    """
+
+    kept_cnt = frozen_cnt = 0
+    kept_numel = frozen_numel = 0
+    total = 0
+
+    for name, p in model.named_parameters():
+        total += 1
+        clean = _clean_name_for_matching(name)
+
+        # default: freeze
+        keep = False
+
+        # 1) Always keep the control_encoder's outer parameters (we may freeze inner backbone below)
+        if clean.startswith("control_encoder"):
+            keep = True
+
+            if freeze_control_backbone and "control_encoder.encoder.backbone" in clean:
+                keep = False  # freeze the backbone parameters
+                # BUT allow projection heads to stay trainable if asked
+                if ".proj" in clean or clean.endswith("proj"):
+                    keep = True
+
+        # 2) Allow specific control-fusion modules inside transformer blocks
+        control_fusion_tokens = (
+            ".cross_attn_control",
+            ".cross_attention_control_norm",
+            ".attention_control_norm",
+            ".control_proj",
+        )
+        if any(tok in clean for tok in control_fusion_tokens):
+            keep = True
+
+        # # 3) Keep crop condition modules (if present)
+        # if clean.startswith("crop_embed") or clean.startswith("crop_proj") or clean.startswith("crop_cond_scales"):
+        #     keep = True
+
+        # # 4) Optionally keep text_pooler (default: freeze). If you want it trainable, uncomment below:
+        # if clean.startswith("text_pooler"):
+        #     keep = True
+
+        # # 5) Keep Switti control head (if you added a specialized head for control)
+        # if clean.startswith("head_nm") or clean.startswith("head"):
+        #     keep = True
+
+        # Set requires_grad
+        p.requires_grad = bool(keep)
+        if keep:
+            kept_cnt += 1
+            kept_numel += p.numel()
+        else:
+            frozen_cnt += 1
+            frozen_numel += p.numel()
+
+    if verbose:
+        print(
+            f"[apply_control_only_freeze] kept={kept_cnt} params ({kept_numel:,} elems), "
+            f"frozen={frozen_cnt} params ({frozen_numel:,} elems), total={total}"
+        )
+
 
 def build_everything(args: arg_util.Args):
     # create tensorboard logger
@@ -75,17 +177,28 @@ def build_everything(args: arg_util.Args):
         control_pretrained=args.control_pretrained,
     )
 
-    print(f"[CONTROL] Encoder type={args.control_encoder_type}, "
-      f"fusion={args.control_fusion}, pretrained={args.control_pretrained}")
+    if args.control_encoder_type:
+        print(f"[CONTROL] Encoder type={args.control_encoder_type}, "
+              f"fusion={args.control_fusion}, pretrained={args.control_pretrained}")
     
-    # === Optional: Freeze Switti backbone (train control encoder only) ===
+    # === Optional: Load Pretained Switti ===
     if getattr(args, "freeze_switti_backbone", False):
-        print("[INFO] Freezing Switti backbone parameters...")
-        for name, param in switti_wo_ddp.named_parameters():
-            if "ada_lin" in name or "control_encoder" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+        if dist.is_master():
+            print("[INFO] Loading pretrained SwittiHF weights from HF (yresearch/Switti)")
+
+        # Load pretrained HF model (SwittiHF)
+        pretrained_hf = SwittiHF.from_pretrained(args.switti_ckpt)
+
+        # Copy HF weights into our training Switti instance
+        missing, unexpected = switti_wo_ddp.load_state_dict(pretrained_hf.state_dict(), strict=False)
+
+        if dist.is_master():
+            print("[INFO] Loaded pretrained weights.")
+            print("  Missing keys   :", len(missing))
+            print("  Unexpected keys:", len(unexpected))
+
+        del pretrained_hf
+        dist.barrier()
     
     # Load VAE and Switti checkpoints
     if args.vae_ckpt is None:
@@ -119,6 +232,18 @@ def build_everything(args: arg_util.Args):
         + "\n\n"
     )
 
+    # === optional: freeze Switti backbone (train only layers related to image conditioning) ===
+    if args.freeze_switti_backbone:
+        def debug_print_trainable(model):
+            kept = []
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    kept.append(n)
+            print("[trainable params sample]", kept[:200])
+        
+        apply_control_only_freeze(switti_wo_ddp, freeze_control_backbone=args.control_pretrained, verbose=dist.is_master())
+        debug_print_trainable(switti_wo_ddp)
+
     # FSDP wrapper
     switti: FSDP = (FSDP if dist.initialized() else NullDDP)(
         switti_wo_ddp,
@@ -136,6 +261,14 @@ def build_everything(args: arg_util.Args):
         'ada_gss', 'moe_bias',
         'scale_mul',
     })
+
+    # sanity: ensure that the number of params passed to the optimizer equals the number of trainable params in unwrapped switti
+    num_trainable_from_filter = sum(p.numel() for p in paras)
+    num_trainable_manual = sum(p.numel() for _, p in switti_wo_ddp.named_parameters() if p.requires_grad)
+    if dist.is_master():
+        print(f"[sanity] trainable params (filter)={num_trainable_from_filter:,}, (unwrapped)={num_trainable_manual:,}")
+    assert num_trainable_from_filter == num_trainable_manual, \
+        "Mismatch between freeze() and optimizer param collection! (Investigate requires_grad names)"
 
     optimizer = torch.optim.AdamW(
         params=para_groups,
@@ -157,7 +290,7 @@ def build_everything(args: arg_util.Args):
     print(f"[build PT data] ...\n")
     print(f"global bs={args.glb_batch_size}, local bs={args.batch_size}")
     dataset_train = build_dataset(
-        args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+        args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso, control_types=args.control_types
     )
     ld_train = DataLoader(
         dataset=dataset_train, num_workers=args.workers, pin_memory=True,
@@ -235,14 +368,17 @@ def main_training():
                 if eval_set_name == "coco":
                     eval_prompts_path = 'eval_prompts/coco.csv'
                     fid_stats_path = args.coco_ref_stats_path
+                    control_images_path = os.path.join(args.data_path, "val_control")
                 else:
                     eval_prompts_path = 'eval_prompts/mjhq.csv'
                     fid_stats_path = args.mjhq_ref_stats_path
+                    control_images_path = None
 
                 with FSDP.summon_full_params(trainer.switti, writeback=False):
                     local_images, local_pick_score, local_clip_score, local_image_reward = distributed_metrics_with_csv(
                         trainer.pipe,
                         eval_prompts_path,
+                        control_images_path,
                         args,
                     )
 
