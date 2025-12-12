@@ -24,11 +24,11 @@ def calc_pick_or_clip_scores(model, image_inputs, text_inputs, batch_size=50):
             "attention_mask": text_inputs["attention_mask"][i : i + batch_size],
         }
         # embed
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             image_embs = model.get_image_features(image_batch)
         image_embs = image_embs / torch.norm(image_embs, dim=-1, keepdim=True)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             text_embs = model.get_text_features(**text_batch)
         text_embs = text_embs / torch.norm(text_embs, dim=-1, keepdim=True)
         # score
@@ -143,16 +143,49 @@ def calculate_scores(
 def distributed_metrics_with_csv(
     pipe,
     csv_path,
+    control_path,
     args,
 ):
     pipe.switti.eval()
     max_count = args.metrics_max_count
-    rank_batches, *_ = prepare_prompts(csv_path, args.eval_batch_size, max_count)
+    rank_caption_batches, rank_filename_batches = prepare_prompts(csv_path, args.eval_batch_size, max_count)
     assert max_count % (args.eval_batch_size * dist.get_world_size()) == 0
     local_images, local_prompts = [], []
-    for batch in tqdm(rank_batches, unit="batch", disable=(dist.get_rank() != 0)):
-        texts = [str(prompt) for prompt in batch
-                 for _ in range(args.num_images_for_metrics)]
+    for captions_batch, filenames_batch in tqdm(
+        zip(rank_caption_batches, rank_filename_batches),
+        unit="batch",
+        disable=(dist.get_rank() != 0)
+    ):
+        captions_batch = list(map(str, captions_batch))
+        filenames_batch = list(map(str, filenames_batch))
+        texts = [
+            caption for caption in captions_batch
+            for _ in range(args.num_images_for_metrics)
+        ]
+        
+        # --------------------------------------------------------
+        # CONTROL-IMAGE LOADING (ONLY if control_path is provided)
+        # --------------------------------------------------------
+        control_dict_batch = None
+
+        if control_path is not None and args.control_types:
+            # Build {ctrl_type : [PIL or None, ...]} matching batch length
+            control_dict_batch = {ctrl: [] for ctrl in args.control_types}
+
+            for fname in filenames_batch:
+                for _ in range(args.num_images_for_metrics):
+                    for ctrl in args.control_types:
+                        if fname == "None":
+                            control_dict_batch[ctrl].append(None)
+                            continue
+
+                        ctrl_fp = os.path.join(control_path, ctrl, fname)
+
+                        if os.path.exists(ctrl_fp):
+                            control_dict_batch[ctrl].append(Image.open(ctrl_fp))
+                        else:
+                            control_dict_batch[ctrl].append(None)
+        
         image_tensors = pipe(
             prompt=texts,
             seed=args.seed,
@@ -161,6 +194,8 @@ def distributed_metrics_with_csv(
             top_p=args.top_p,
             more_smooth=False,
             return_pil=False,
+            mid_reso=args.mid_reso,
+            control_dict=control_dict_batch,
         )
 
         local_images.extend(image_tensors)
@@ -192,21 +227,29 @@ def save_images(images, prompts, save_path):
 def prepare_prompts(prompts_path, batch_size=1, max_count=None):
     assert max_count % dist.get_world_size() == 0
     df = pd.read_csv(prompts_path)
-    all_text = list(df["captions"])
+
+    captions = df["captions"].astype(str).tolist()
+
+    if "file_name" in df.columns:
+        filenames = df["file_name"].astype(str).tolist()
+    else:
+        filenames = [None] * len(df)
 
     if max_count is not None:
-        all_text = all_text[:max_count]
+        captions = captions[:max_count]
+        filenames = filenames[:max_count]
 
     num_batches = (
-        (len(all_text) - 1) // (batch_size * dist.get_world_size()) + 1
+        (len(captions) - 1) // (batch_size * dist.get_world_size()) + 1
     ) * dist.get_world_size()
-    all_batches = np.array_split(np.array(all_text), num_batches)
-    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
 
-    index_list = np.arange(len(all_text))
-    all_batches_index = np.array_split(index_list, num_batches)
-    rank_batches_index = all_batches_index[dist.get_rank() :: dist.get_world_size()]
-    return rank_batches, rank_batches_index, all_text
+    caption_batches = np.array_split(np.array(captions), num_batches)
+    filename_batches = np.array_split(np.array(filenames), num_batches)
+
+    rank_caption_batches = caption_batches[dist.get_rank() :: dist.get_world_size()]
+    rank_filename_batches = filename_batches[dist.get_rank() :: dist.get_world_size()]
+
+    return rank_caption_batches, rank_filename_batches
 
 
 def to_PIL_image(image_tensor):
