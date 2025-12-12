@@ -245,8 +245,8 @@ class Switti(nn.Module):
         prompt_attn_bias: torch.Tensor,
         batch_height: list[int] | None = None,
         batch_width: list[int] | None = None,
-        control_image: torch.Tensor | None = None,
-        control_attn_mask: torch.Tensor | None = None,
+        control_dict: dict[str, torch.Tensor] | None = None,
+        control_attn_mask_dict: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # returns logits_BLV
         """
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
@@ -259,6 +259,8 @@ class Switti(nn.Module):
         boolean mask to specify which tokens are not padding
         :param batch_height (B,): original height of images in a batch.
         :param batch_width (B,): original width of images in a batch.
+        :param control_dict: dict mapping control type to tensor (B,3,H,W)
+        :param control_attn_mask_dict: optional dict mapping control type to attention masks
         Only used when self.use_crop_cond = True
         :return: logits BLV, V is vocab_size. Token probabilities for the next scale
         """
@@ -298,18 +300,25 @@ class Switti(nn.Module):
         attn_bias = attn_bias.to(dtype=main_type)
 
         # --- control encoding (optional) ---
-        control_context = None
-        control_context_attn_bias = None
-        if control_image is not None and self.control_encoder is not None:
-            # assume control_image is normalized and shape (B,3,H,W)
-            control_tokens = self.control_encoder(control_image)  # (B, Lc, ctrl_dim)
-            # optionally create an attention mask: None or from control_attn_mask
-            control_context = control_tokens.to(dtype=main_type)
-            if control_attn_mask is not None:
-                # mask shape expected: (B, Lc) boolean; convert to attn bias shape (B, Lq, 1, Lc) or just pass None
-                # AdaLNSelfCrossAttn/CrossAttention expect `context_attn_bias` shaped (B, Lc) or attn_mask style
-                control_context_attn_bias = control_attn_mask.to(dtype=main_type)
+        control_contexts = None
+        control_context_attn_biases = None
 
+        if control_dict is not None and self.control_encoder is not None:
+            control_contexts = {}
+            control_context_attn_biases = {}
+            for ctrl_type, ctrl_img in control_dict.items():
+                if ctrl_img is None:
+                    continue
+                ctrl_tokens = self.control_encoder(ctrl_img)  # (B, Lc, ctrl_dim)
+                control_contexts[ctrl_type] = ctrl_tokens.to(dtype=main_type)
+                if control_attn_mask_dict is not None and ctrl_type in control_attn_mask_dict:
+                    control_context_attn_biases[ctrl_type] = control_attn_mask_dict[ctrl_type].to(dtype=main_type)
+                else:
+                    # default: all tokens valid
+                    Lc = ctrl_tokens.shape[1]
+                    control_context_attn_biases[ctrl_type] = torch.ones(
+                        (B, Lc), dtype=torch.bool, device=ctrl_tokens.device
+                    )
 
         for block in self.blocks:
             if self.use_gradient_checkpointing:
@@ -322,8 +331,8 @@ class Switti(nn.Module):
                     freqs_cis=self.freqs_cis,
                     context_attn_bias=prompt_attn_bias,
                     crop_cond=crop_cond,
-                    control_context=control_context,
-                    control_context_attn_bias=control_context_attn_bias,
+                    control_contexts=control_contexts,
+                    control_context_attn_biases=control_context_attn_biases,
                     use_reentrant=False,
                 )
             else:
@@ -335,8 +344,8 @@ class Switti(nn.Module):
                     freqs_cis=self.freqs_cis,
                     context_attn_bias=prompt_attn_bias,
                     crop_cond=crop_cond,
-                    control_context=control_context,
-                    control_context_attn_bias=control_context_attn_bias,
+                    control_contexts=control_contexts,
+                    control_context_attn_biases=control_context_attn_biases,
                 )
 
         with torch.amp.autocast('cuda', enabled=not self.training):
