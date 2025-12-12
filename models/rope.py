@@ -40,7 +40,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 
 
 def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor):
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.amp.autocast('cuda', enabled=False):
         x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
         # freqs_cis = reshape_for_broadcast(freqs_cis, x).to(x_in.device)
         freqs_cis = freqs_cis[None, :, : x.shape[2], ...].to(x_in.device)

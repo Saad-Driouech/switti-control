@@ -172,7 +172,7 @@ class VQVAEHF(VQVAE, PyTorchModelHubMixin):
         ch=160,
         test_mode=True,
         share_quant_resi=4,
-        reso=1024,
+        reso=512,
     ):
         v_patch_nums = tuple((int(x) for x in RESOLUTION_PATCH_NUMS_MAPPING[reso].split("_")))
         super().__init__(

@@ -105,7 +105,8 @@ def generate_depth(img):
 
 def main(root_dir, subset="train2014"):
     input_dir = os.path.join(root_dir, subset)
-    control_root = os.path.join(root_dir, "control")
+    control_root = os.path.join(root_dir, "val_control")
+    print(f"Generating control images for {subset} and saving them to {control_root}")
 
     input_files = [
         f for f in os.listdir(input_dir)
