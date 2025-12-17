@@ -227,7 +227,16 @@ class CrossAttention(nn.Module):
             v = self.cached_v
 
         if context_attn_bias is not None:
-            context_attn_bias = rearrange(context_attn_bias, "b j -> b 1 1 j")
+            if context_attn_bias.ndim == 2:
+                # Legacy 2D padding mask: (B, L_key)
+                # Convert to 4D: (B, 1, 1, L_key) - broadcasts across all queries
+                context_attn_bias = rearrange(context_attn_bias, "b j -> b 1 1 j")
+            elif context_attn_bias.ndim == 4:
+                # New 4D structural mask: (1, 1, L_query, L_key) or (B, H, L_query, L_key)
+                # Use as-is (already correct shape)
+                pass
+            else:
+                raise ValueError(f"Unsupported mask shape: {context_attn_bias.shape}")
 
         dropout_p = self.attn_drop if self.training else 0.0
         out = (
@@ -491,7 +500,10 @@ class AdaLNSelfCrossAttn(nn.Module):
         # --- Image control fusion (two modes) ---
         if control_contexts is not None:
             for ctrl_type, control_context in control_contexts.items():
-                # (optional) normalize control tokens
+                # Ensure length matches (safety check)
+                assert control_context.shape[1] == x.shape[1], \
+                    f"Control length {control_context.shape[1]} != x length {x.shape[1]}"
+                
                 normed_ctrl = (
                     self.attention_control_norm(control_context)
                     if self.attention_control_norm is not None
@@ -499,38 +511,19 @@ class AdaLNSelfCrossAttn(nn.Module):
                 ).to(x.dtype)
 
                 if self.control_fusion == "cross" and self.cross_attn_control is not None:
-                    # Cross-attention fusion
-                    control_attn_bias = None
-                    if control_context_attn_biases is not None:
-                        control_attn_bias = control_context_attn_biases.get(ctrl_type, None)
-                    
-                    if control_attn_bias is None:
-                        control_attn_bias = torch.ones(
-                            (x.shape[0], control_context.shape[1]),
-                            dtype=torch.bool,
-                            device=x.device
-                        )
-
+                    # Cross-attention fusion (uses structural mask)
                     x = x + self.cross_attention_control_norm2(
                         self.cross_attn_control(
                             self.cross_attention_control_norm1(x),
                             normed_ctrl,
-                            context_attn_bias=control_attn_bias,
+                            context_attn_bias=attn_bias,
                             freqs_cis=freqs_cis,
                         )
                     )
                 elif self.control_fusion == "add" and self.control_proj is not None:
                     # Additive fusion:
                     proj = self.control_proj(normed_ctrl).type_as(x)
-
-                    L_x = x.shape[1]
-                    Lc = proj.shape[1]
-
-                    if Lc == L_x:
-                        x = x + proj
-                    else:
-                        pooled = proj.mean(dim=1, keepdim=True)
-                        x = x + pooled
+                    x = x + proj
                 else:
                     # fallback silently ignore if fusion requested but no module available
                     pass
