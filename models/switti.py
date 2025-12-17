@@ -134,6 +134,7 @@ class Switti(nn.Module):
             self.control_encoder = ControlEncoder(
                 encoder_type=control_encoder_type,
                 control_context_dim=control_context_dim,
+                patch_nums=patch_nums,
                 pretrained=control_pretrained,
             )
         else:
@@ -301,24 +302,46 @@ class Switti(nn.Module):
 
         # --- control encoding (optional) ---
         control_contexts = None
-        control_context_attn_biases = None
 
         if control_dict is not None and self.control_encoder is not None:
             control_contexts = {}
-            control_context_attn_biases = {}
+
             for ctrl_type, ctrl_img in control_dict.items():
                 if ctrl_img is None:
                     continue
-                ctrl_tokens = self.control_encoder(ctrl_img)  # (B, Lc, ctrl_dim)
-                control_contexts[ctrl_type] = ctrl_tokens.to(dtype=main_type)
-                if control_attn_mask_dict is not None and ctrl_type in control_attn_mask_dict:
-                    control_context_attn_biases[ctrl_type] = control_attn_mask_dict[ctrl_type].to(dtype=main_type)
-                else:
-                    # default: all tokens valid
-                    Lc = ctrl_tokens.shape[1]
-                    control_context_attn_biases[ctrl_type] = torch.ones(
-                        (B, Lc), dtype=torch.bool, device=ctrl_tokens.device
+                
+                # Get multi-scale features from encoder
+                ctrl_ms = self.control_encoder(ctrl_img)
+                
+                # --- TRAINING: Concatenate all scales ---
+                if self.training:
+                    ctrl_tokens_list = []
+                    
+                    # Add SOS dummy token (to match x_BLC which has SOS)
+                    dummy_sos = torch.zeros(
+                        B, self.first_l, self.control_context_dim, 
+                        device=ctrl_img.device, dtype=ctrl_img.dtype
                     )
+                    ctrl_tokens_list.append(dummy_sos)
+                    
+                    # Concatenate all scales 
+                    for pn in self.patch_nums[1:]:
+                        tokens = ctrl_ms[pn]
+                        ctrl_tokens_list.append(tokens)
+                    
+                    # Fuse into aligned sequence
+                    aligned_ctrl = torch.cat(ctrl_tokens_list, dim=1)
+                    control_contexts[ctrl_type] = aligned_ctrl.to(dtype=main_type)
+                
+                # --- INFERENCE: Not used in this forward (handled in pipeline.py) ---
+                else:
+                    # During inference, control is handled scale-by-scale in pipeline.py
+                    # This forward() is only called during training
+                    pass
+
+        if control_contexts is not None:
+            for k, v in control_contexts.items():
+                assert v.shape[1] == x_BLC.shape[1], f"Length mismatch: {v.shape[1]} != {x_BLC.shape[1]}"
 
         for block in self.blocks:
             if self.use_gradient_checkpointing:
@@ -332,7 +355,7 @@ class Switti(nn.Module):
                     context_attn_bias=prompt_attn_bias,
                     crop_cond=crop_cond,
                     control_contexts=control_contexts,
-                    control_context_attn_biases=control_context_attn_biases,
+                    control_context_attn_biases=attn_bias,
                     use_reentrant=False,
                 )
             else:
@@ -345,7 +368,7 @@ class Switti(nn.Module):
                     context_attn_bias=prompt_attn_bias,
                     crop_cond=crop_cond,
                     control_contexts=control_contexts,
-                    control_context_attn_biases=control_context_attn_biases,
+                    control_context_attn_biases=attn_bias,
                 )
 
         with torch.amp.autocast('cuda', enabled=not self.training):

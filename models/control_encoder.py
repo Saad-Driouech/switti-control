@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Literal
+from typing import Literal, Tuple
 from torchvision import models
 import timm
 
@@ -92,10 +92,7 @@ class CustomViTBackbone(nn.Module):
 
     # --------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-
         patches = self.patch_embed(x)
-        _, D, Hc, Wc = patches.shape
         tokens = patches.flatten(2).transpose(1, 2)
         L = tokens.size(1)
 
@@ -123,6 +120,12 @@ class CNNControlEncoder(nn.Module):
             backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
             self.backbone = nn.Sequential(*list(backbone.children())[:-2])
             in_ch = 512
+            
+            # Add ImageNet normalization constants
+            self.register_buffer('imagenet_mean', 
+                torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer('imagenet_std', 
+                torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         else:
             layers, in_ch, ch = [], 3, mid_channels
             for _ in range(num_downsamples):
@@ -143,6 +146,11 @@ class CNNControlEncoder(nn.Module):
         self.proj = nn.Conv2d(in_ch, out_channels, kernel_size=1)
 
     def forward(self, x):
+        if self.pretrained:
+            # Convert [-1, 1] -> [0, 1]
+            x = (x + 1) / 2
+            # Apply ImageNet normalization
+            x = (x - self.imagenet_mean) / self.imagenet_std
         feat = self.backbone(x)
         return self.proj(feat)
 
@@ -162,15 +170,24 @@ class ViTControlEncoder(nn.Module):
     ):
         super().__init__()
         self.pretrained = pretrained
+        self.patch_size = patch_size
 
         if pretrained:
             self.backbone = timm.create_model(
                 "vit_small_patch16_224",
                 pretrained=True,
                 num_classes=0,
+                features_only=False,
             )
             backbone_dim = self.backbone.embed_dim
             self.expected_size = self.backbone.patch_embed.img_size[0]
+            self.patch_size = self.backbone.patch_embed.patch_size[0]
+
+            # Add ImageNet normalization constants
+            self.register_buffer('imagenet_mean', 
+                torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer('imagenet_std', 
+                torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         else:
             self.backbone = CustomViTBackbone(
@@ -182,12 +199,15 @@ class ViTControlEncoder(nn.Module):
             backbone_dim = vit_hidden
             self.expected_size = None
 
+        # ViT works with 1D tokens (B, L, D), so use nn.Linear for projection
         self.proj = nn.Linear(backbone_dim, out_dim)
 
     def forward(self, x):
         if self.pretrained:
             x = (x + 1) / 2
             x = torch.clamp(x, 0, 1)
+
+            x = (x - self.imagenet_mean) / self.imagenet_std
 
             if x.shape[2] != self.expected_size:
                 x = F.interpolate(
@@ -197,56 +217,123 @@ class ViTControlEncoder(nn.Module):
                     align_corners=False,
                 )
 
-            feats = self.backbone.forward_features(x)
+            feats = self.backbone.forward_features(x) # (B, 1+L, D_backbone)
 
             # remove CLS if present
             if feats.shape[1] > 1 and hasattr(self.backbone, "global_pool"):
-                feats = feats[:, 1:]
+                feats = feats[:, 1:] # (B, L, D_backbone)
 
-            return self.proj(feats)
+        else:
+            feats = self.backbone(x) # (B, L, D_backbone)
 
-        feats = self.backbone(x)
-        return self.proj(feats)
+        # Apply Linear projection: (B, L, D_backbone) -> (B, L, D_out)
+        out = self.proj(feats) 
+
+        # --- Convert 1D token sequence back to 2D feature map ---
+        B, L, D = out.shape
+        side = int(L**0.5)
+        
+        # Check if L is a perfect square, which it must be for a ViT token sequence
+        if side * side != L:
+            raise ValueError(f"ViT output sequence length {L} is not a perfect square. Cannot convert to 2D feature map.")
+            
+        # Reshape (B, L, D) -> (B, D, Hc, Wc)
+        feat_map = out.transpose(1, 2).reshape(B, D, side, side)
+        
+        return feat_map # (B, D, Hc, Wc)
 
 
 # ============================================================
-# ------------------------- WRAPPER --------------------------
+# -------------- MULTI-SCALE WRAPPER -------------------------
 # ============================================================
-class ControlEncoder(nn.Module):
+class MultiScaleControlEncoder(nn.Module):
+    """
+    Encodes control image to multiple scales matching Switti's patch_nums.
+    
+    Returns dict: {patch_num: (B, patch_num², control_dim)}
+    """
     def __init__(
         self,
         encoder_type: Literal["cnn", "vit"] = "cnn",
         control_context_dim: int = 512,
+        patch_nums: Tuple[int, ...] = (1, 2, 3, 4, 6, 9, 13, 18, 24, 32),
         pretrained: bool = False,
     ):
         super().__init__()
         self.encoder_type = encoder_type
+        self.patch_nums = patch_nums
+        self.control_context_dim = control_context_dim
 
+        # Base encoder (outputs spatial features: B, C, H_feat, W_feat)
         if encoder_type == "cnn":
             self.encoder = CNNControlEncoder(
                 out_channels=control_context_dim,
                 pretrained=pretrained,
             )
-            self.is_cnn = True
-
         elif encoder_type == "vit":
             self.encoder = ViTControlEncoder(
                 out_dim=control_context_dim,
                 pretrained=pretrained,
             )
-            self.is_cnn = False
-
         else:
-            raise ValueError(f"Invalid type: {encoder_type}")
+            raise ValueError(f"Invalid encoder_type: {encoder_type}")
 
     def forward(self, img):
+        """
+        Args:
+            img: (B, 3, H, W) control image
+            
+        Returns:
+            dict[int, Tensor]: {patch_num: (B, patch_num², control_dim)}
+        """
         if img is None:
             return None
 
-        out = self.encoder(img)
+        # Extract spatial features
+        features = self.encoder(img)  # (B, control_dim, H_feat, W_feat)
 
-        if self.is_cnn:
-            B, C, Hc, Wc = out.shape
-            return out.flatten(2).transpose(1, 2)
+        # Adaptively pool to each target scale
+        control_per_scale = {}
+        for pn in self.patch_nums:
+            # Pool to target resolution
+            pooled = F.adaptive_avg_pool2d(features, (pn, pn))  # (B, C, pn, pn)
+            
+            # Flatten to tokens (B, pn², C)
+            tokens = pooled.flatten(2).transpose(1, 2)
+            
+            control_per_scale[pn] = tokens
 
-        return out
+        return control_per_scale
+
+
+# ============================================================
+# ---------------------- WRAPPER -----------------------------
+# ============================================================
+class ControlEncoder(nn.Module):
+    """
+    Main control encoder class that dispatches to multi-scale implementation.
+    """
+    def __init__(
+        self,
+        encoder_type: Literal["cnn", "vit"] = "cnn",
+        control_context_dim: int = 512,
+        patch_nums: Tuple[int, ...] = (1, 2, 3, 4, 6, 9, 13, 18, 24, 32),
+        pretrained: bool = False,
+    ):
+        super().__init__()
+        self.encoder = MultiScaleControlEncoder(
+            encoder_type=encoder_type,
+            control_context_dim=control_context_dim,
+            patch_nums=patch_nums,
+            pretrained=pretrained,
+        )
+
+    def forward(self, img):
+        """
+        Args:
+            img: (B, 3, H, W) or None
+            
+        Returns:
+            dict[int, Tensor] or None: {patch_num: (B, patch_num², control_dim)}
+        """
+        return self.encoder(img)

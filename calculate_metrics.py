@@ -179,6 +179,7 @@ def distributed_metrics_with_csv(
                             control_dict_batch[ctrl].append(None)
                             continue
 
+                        fname = fname.replace(".jpg", ".png")
                         ctrl_fp = os.path.join(control_path, ctrl, fname)
 
                         if os.path.exists(ctrl_fp):

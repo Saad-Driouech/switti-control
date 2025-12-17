@@ -3,7 +3,7 @@ from torchvision.transforms import ToPILImage
 from PIL.Image import Image as PILImage
 import numpy as np
 from torchvision.transforms import functional as TF
-import torch.nn.functional as F
+from torchvision.transforms import InterpolationMode
 
 from models.vqvae import VQVAEHF
 from models.clip import FrozenCLIPEmbedder
@@ -113,7 +113,7 @@ class SwittiPipeline:
         
         # 2. Resize to mid-res
         mid_reso_px = round(TRAIN_IMAGE_SIZE[0] * mid_reso)
-        img = F.interpolate(img, size=mid_reso_px, mode="bicubic", align_corners=False)
+        img = TF.resize(img, mid_reso_px, interpolation=InterpolationMode.BICUBIC, antialias=True)
 
         # 3. Center crop to final
         img = TF.center_crop(img, TRAIN_IMAGE_SIZE)
@@ -166,15 +166,12 @@ class SwittiPipeline:
         context, cond_vector, context_attn_bias = self.encode_prompt(prompt, null_prompt)
 
         # --------------------------------------------------
-        # Control Image Encoding (robust version)
+        # Control Image Encoding (multi-scale)
         # --------------------------------------------------
-        control_contexts = None
-        control_context_attn_biases = None
+        control_contexts_per_scale = None  # {scale_num: {ctrl_type: (B, scale², D)}}
 
         if control_dict is not None and hasattr(self.switti, "control_encoder"):
-
-            control_contexts = {}
-            control_context_attn_biases = {}
+            control_contexts_per_scale = {}
 
             for ctrl_type, ctrl_input in control_dict.items():
 
@@ -199,42 +196,23 @@ class SwittiPipeline:
                 if all(p is None for p in processed):
                     continue
 
-                # Replace None with zeros
-                final = []
-                for p in processed:
-                    if p is None:
-                        # fill with zeros; shape matches first valid
-                        shape = next(v.shape for v in processed if v is not None)
-                        final.append(torch.zeros(shape, device=self.device, dtype=self.model_dtype))
-                    else:
-                        final.append(p)
+                # Stack into batch
+                ctrl_batch = torch.cat([
+                    p if p is not None else torch.zeros_like(processed[0])
+                    for p in processed
+                ], dim=0)
 
-                # stack → (B,3,H,W)
-                ctrl_batch = torch.cat(final, dim=0)
+                # Get multi-scale control features
+                ctrl_ms = self.switti.control_encoder(ctrl_batch) # ctrl_ms = {1: (B,1,D), 2: (B,4,D), ..., 32: (B,1024,D)}
 
-                assert ctrl_batch.ndim == 4 and ctrl_batch.shape[1] == 3, \
-                    f"ctrl_batch must be BCHW with 3 channels, got {tuple(ctrl_batch.shape)}"
-
-                # # Preprocess to correct resolution (B,3,H,W)
-                # ctrl_batch = torch.nn.functional.interpolate(
-                #     ctrl_batch,
-                #     size=TRAIN_IMAGE_SIZE,
-                #     mode="bicubic",
-                #     align_corners=False,
-                # )
-
-                # Encode control tokens → (B, Lc, ctrl_dim)
-                ctx = self.switti.control_encoder(ctrl_batch)
-                # --- Repeat control contexts for CFG ---
-                ctx = ctx.repeat(2, 1, 1)
-
-                control_contexts[ctrl_type] = ctx
-
-                # attention mask: all tokens valid
-                Bc, Lc, _ = ctx.shape
-                control_context_attn_biases[ctrl_type] = torch.ones(
-                    (Bc, Lc), dtype=torch.bool, device=self.device
-                )
+                # Store per-scale for use in generation loop
+                for scale, tokens in ctrl_ms.items():
+                    if scale not in control_contexts_per_scale:
+                        control_contexts_per_scale[scale] = {}
+                    
+                    # Repeat for CFG (conditional + unconditional)
+                    tokens_cfg = tokens.repeat(2, 1, 1)
+                    control_contexts_per_scale[scale][ctrl_type] = tokens_cfg
 
 
         B = context.shape[0] // 2
@@ -276,6 +254,16 @@ class SwittiPipeline:
             else:
                 freqs_cis = switti.freqs_cis
 
+             # Get control tokens for THIS scale only
+            scale_control_contexts = None
+            if control_contexts_per_scale is not None and pn in control_contexts_per_scale:
+                scale_control_contexts = control_contexts_per_scale[pn]
+                # scale_control_contexts = {ctrl_type: (2B, pn², D)} for this specific scale
+
+            if scale_control_contexts is not None:
+                for k, v in scale_control_contexts.items():
+                    assert v.shape[1] == pn * pn, f"Scale {pn}: expected {pn*pn} tokens, got {v.shape[1]}"
+
             if si >= turn_off_cfg_start_si:
                 apply_smooth = False
                 x_BLC = x_BLC[:B]
@@ -285,8 +273,10 @@ class SwittiPipeline:
                 cond_BD = cond_BD[:B]
                 if crop_cond is not None:
                     crop_cond = crop_cond[:B]
-                if control_contexts is not None:
-                    control_contexts = {k: v[:B] for k, v in control_contexts.items()}
+                if scale_control_contexts is not None:
+                    scale_control_contexts = {
+                        k: v[:B] for k, v in scale_control_contexts.items()
+                    }
                 for b in switti.blocks:
                     if b.attn.caching and b.attn.cached_k is not None:
                         b.attn.cached_k = b.attn.cached_k[:B]
@@ -304,8 +294,8 @@ class SwittiPipeline:
                     attn_bias=None,
                     context=context,
                     context_attn_bias=context_attn_bias,
-                    control_contexts=control_contexts,
-                    control_context_attn_biases=control_context_attn_biases,
+                    control_contexts=scale_control_contexts,
+                    control_context_attn_biases=None,
                     freqs_cis=freqs_cis,
                     crop_cond=crop_cond,
                 )
