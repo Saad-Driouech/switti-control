@@ -23,3 +23,5 @@ apex/
 *.sh
 *.o*
 tests/
+logs/
+inference.py

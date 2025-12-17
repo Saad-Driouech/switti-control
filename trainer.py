@@ -57,7 +57,7 @@ def generate_logging_prompts_captions(
     captions_json_path: str,
     control_path: str | None,
     control_types: list[str] | None,
-    num_select: int = 10,
+    num_select: int = 12,
 ) -> tuple[list[str], list[str], dict[str, list[Image.Image] | None]]:
     """
     Select files from missing files list, fetch captions from COCO captions JSON,
@@ -468,7 +468,11 @@ class SwittiTrainer(object):
                     torch.cuda.empty_cache()
                     for cfg in [6]: # SAAD: add o
                         subprompt = prompt[:16]
-                        n_show = min(len(subprompt), next(iter(control_dict.values())).shape[0]) if control_dict else len(subprompt)
+                        if control_dict and any(v is not None for v in control_dict.values()):
+                            first_valid = next(v for v in control_dict.values() if v is not None)
+                            n_show = min(len(subprompt), first_valid.shape[0])
+                        else:
+                            n_show = len(subprompt)
                         ctrl_for_pipe = self._build_ctrl_for_pipe(control_dict, n_show)
                         imgs = self.pipe(subprompt,
                                          cfg=cfg,
