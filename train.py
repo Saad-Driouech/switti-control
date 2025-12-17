@@ -8,6 +8,7 @@ from trainer import SwittiTrainer
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.utils.data import DataLoader
+import torch.nn as nn
 from typing import Iterable
 
 import dist
@@ -125,6 +126,27 @@ def apply_control_only_freeze(
             f"frozen={frozen_cnt} params ({frozen_numel:,} elems), total={total}"
         )
 
+def zero_init_control_layers(model):
+    """
+    Initialize the output projection of control layers to zero.
+    This ensures at step 0: Output = Switti(Input) + 0
+    """
+    print("[INFO] Zero-initializing control projection layers...")
+    
+    for name, module in model.named_modules():
+        # 1. For Cross-Attention Fusion (in basic_switti.py)
+        if hasattr(module, "cross_attn_control") and module.cross_attn_control is not None:
+            nn.init.zeros_(module.cross_attn_control.proj.weight)
+            if module.cross_attn_control.proj.bias is not None:
+                nn.init.zeros_(module.cross_attn_control.proj.bias)
+            print(f"  ✓ Zeroed {name}.cross_attn_control.proj")
+        
+        # 2. For Additive Fusion (if you use it)
+        if hasattr(module, "control_proj") and module.control_proj is not None:
+            nn.init.zeros_(module.control_proj.weight)
+            if module.control_proj.bias is not None:
+                nn.init.zeros_(module.control_proj.bias)
+            print(f"  ✓ Zeroed {name}.control_proj")
 
 def build_everything(args: arg_util.Args):
     # create tensorboard logger
@@ -216,6 +238,9 @@ def build_everything(args: arg_util.Args):
     if args.use_gradient_checkpointing:
         switti_wo_ddp.enable_gradient_checkpointing()
 
+    if args.control_encoder_type is not None:
+        zero_init_control_layers(switti_wo_ddp)
+
     print(f"[INIT] Switti model = {switti_wo_ddp}\n\n")
     count_p = lambda m: f"{sum(p.numel() for p in m.parameters())/1e6:.2f}"
     print(f"[INIT][#para] "
@@ -245,7 +270,8 @@ def build_everything(args: arg_util.Args):
         debug_print_trainable(switti_wo_ddp)
 
     # FSDP wrapper
-    switti: FSDP = (FSDP if dist.initialized() else NullDDP)(
+    use_fsdp_now = dist.initialized() and args.use_fsdp
+    switti: FSDP = (FSDP if use_fsdp_now else NullDDP)(
         switti_wo_ddp,
         auto_wrap_policy=lambda module, recurse, **_etc: recurse or isinstance(module, AdaLNSelfCrossAttn),
         device_id=dist.get_local_rank(),
