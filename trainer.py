@@ -6,6 +6,7 @@ import random
 from collections import defaultdict
 from PIL import Image
 from PIL.Image import Image as PILImage
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -188,6 +189,9 @@ class SwittiTrainer(object):
         )
         print(f"[Trainer] logging prompts {self.log_prompts}")
         print(f"[Trainer] logging control dict {self.log_control_dict}")
+        df = pd.read_csv("eval_prompts/mjhq.csv")
+        self.mjhq_prompts = df["captions"].astype(str).tolist()[:12]
+        print(f"[Trainer] MJHQ prompts {self.mjhq_prompts}")
         param = next(self.switti.parameters()).to(self.device)
         self.model_dtype = param.dtype
 
@@ -526,6 +530,33 @@ class SwittiTrainer(object):
                         #     control_dict=self.log_control_dict,
                         #     g_it=g_it,
                         # )
+
+                        # NEW: Log MJHQ T2I samples
+                        imgs = self.pipe(
+                            prompt=self.mjhq_prompts,
+                            cfg=cfg,
+                            top_k=self.args.top_k,
+                            top_p=self.args.top_p,
+                            return_pil=False,
+                            mid_reso=self.args.mid_reso,
+                            control_dict=None,  # T2I, no control
+                        )
+                        imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+                        self._log_pipe_outputs(
+                            tb_lg,
+                            tag_prefix=f"mjhq_t2i_samples_cfg_topk={self.args.top_k}_topp={self.args.top_p}_cfg={cfg}",
+                            imgs=imgs,
+                            control_dict=None,
+                            g_it=g_it,
+                        )
+                        # Log prompts
+                        prompt_text = "\n".join([f"{i}: {p}" for i, p in enumerate(self.mjhq_prompts)])
+                        tb_lg.log_text(
+                            f"mjhq_t2i_prompts_cfg={cfg}",
+                            prompt_text,
+                            step=g_it
+                        )
+
                         del imgs
 
             if dist.is_master():
