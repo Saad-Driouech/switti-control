@@ -238,8 +238,10 @@ def build_everything(args: arg_util.Args):
     if args.use_gradient_checkpointing:
         switti_wo_ddp.enable_gradient_checkpointing()
 
-    if args.control_encoder_type is not None:
+    if args.control_encoder_type is not None and start_it == 0:
         zero_init_control_layers(switti_wo_ddp)
+    elif args.control_encoder_type is not None and start_it > 0:
+        print(f"[INFO] Skipping zero-init (resuming from iteration {start_it})")
 
     print(f"[INIT] Switti model = {switti_wo_ddp}\n\n")
     count_p = lambda m: f"{sum(p.numel() for p in m.parameters())/1e6:.2f}"
