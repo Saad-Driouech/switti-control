@@ -231,6 +231,7 @@ def build_everything(args: arg_util.Args):
         vae_local.load_state_dict(torch.load(args.vae_ckpt, map_location="cpu"), strict=True)
     else:
         vae_local = VQVAEHF.from_pretrained(args.vae_ckpt).to(dist.get_device())
+        pipe.vae = vae_local
 
     start_it = load_model_state(args, switti_wo_ddp)
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
@@ -321,7 +322,11 @@ def build_everything(args: arg_util.Args):
         args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso, control_types=args.control_types
     )
     ld_train = DataLoader(
-        dataset=dataset_train, num_workers=args.workers, pin_memory=True,
+        dataset=dataset_train, 
+        num_workers=args.workers, 
+        persistent_workers=True if args.workers > 0 else False,
+        prefetch_factor=2 if args.workers > 0 else None, 
+        pin_memory=True,
         generator=args.get_different_generator_for_each_rank(), # worker_init_fn=worker_init_fn,
         collate_fn=coco_collate_fn,
         batch_sampler=DistInfiniteBatchSampler(
@@ -330,6 +335,14 @@ def build_everything(args: arg_util.Args):
         ),
     )
     del dataset_train
+
+    # print("[Train] After data loader creation")
+
+    if start_it > 0:
+        print(f"[FIX] Resetting batch sampler start_it from {start_it} to 0 to avoid slow seeking")
+        # The actual training iteration is tracked by the for loop (cur_iter),
+        # not by the batch sampler, so this is safe
+        ld_train.batch_sampler.start_it = 0
 
     # build trainer
     trainer = SwittiTrainer(
