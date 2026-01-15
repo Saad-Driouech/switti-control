@@ -409,8 +409,11 @@ class AdaLNSelfCrossAttn(nn.Module):
                 proj_drop=drop,
                 qk_norm=qk_norm,
             )
+            # Learnable control gate
+            self.control_gate = nn.Parameter(torch.tensor(-2.0))
         else:
             self.cross_attn_control = None
+            self.control_gate = None
 
         # If additive fusion, create a projection from control_dim -> embed_dim
         if control_context_dim and self.control_fusion == "add":
@@ -512,14 +515,15 @@ class AdaLNSelfCrossAttn(nn.Module):
 
                 if self.control_fusion == "cross" and self.cross_attn_control is not None:
                     # Cross-attention fusion (uses structural mask)
-                    x = x + self.cross_attention_control_norm2(
-                        self.cross_attn_control(
-                            self.cross_attention_control_norm1(x),
-                            normed_ctrl,
-                            context_attn_bias=attn_bias,
-                            freqs_cis=freqs_cis,
-                        )
+                    control_out = self.cross_attn_control(
+                        self.cross_attention_control_norm1(x),
+                        normed_ctrl,
+                        context_attn_bias=attn_bias,
+                        freqs_cis=freqs_cis,
                     )
+                    # Apply learned gate (sigmoid to keep in [0,1])
+                    gate = torch.sigmoid(self.control_gate)
+                    x = x + gate * self.cross_attention_control_norm2(control_out)
                 elif self.control_fusion == "add" and self.control_proj is not None:
                     # Additive fusion:
                     proj = self.control_proj(normed_ctrl).type_as(x)
