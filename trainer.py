@@ -335,7 +335,8 @@ class SwittiTrainer(object):
     def train_step(
         self,
         g_it: int,
-        tb_lg: TensorboardLogger
+        tb_lg: TensorboardLogger,
+        control_strength: float = 1.0,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # forward
         train_control_only = getattr(self.args, "freeze_switti_backbone", False)
@@ -366,7 +367,9 @@ class SwittiTrainer(object):
                     if v is None: 
                         processed[k] = None
                     else:
-                        processed[k] = v.to(self.device, non_blocking=True).to(self.model_dtype)
+                        v_device = v.to(self.device, non_blocking=True).to(self.model_dtype)
+                        # SCALE BY CONTROL STRENGTH (element-wise multiplication)
+                        processed[k] = v_device * control_strength
                 control_dict = processed
 
             inp_B3HW = image.to(self.device, non_blocking=True)
@@ -562,6 +565,23 @@ class SwittiTrainer(object):
             if dist.is_master():
                 tb_lg.update(head="Logits_stats", **logits_lg, step=g_it)
                 tb_lg.update(head="AR_iter_loss", **kw, step=g_it)
+
+                # Log control gate values
+                if hasattr(self.switti_wo_ddp, 'blocks'):
+                    gate_values = []
+                    for i, block in enumerate(self.switti_wo_ddp.blocks):
+                        if hasattr(block, 'control_gate') and block.control_gate is not None:
+                            gate = torch.sigmoid(block.control_gate).item()
+                            gate_values.append(gate)
+                    
+                    if gate_values:
+                        tb_lg.update(
+                            head="Control_gates",
+                            mean=sum(gate_values) / len(gate_values),
+                            min=min(gate_values),
+                            max=max(gate_values),
+                            step=g_it
+                        )
             print(f"LOGGING {g_it} FINISHED")
             if self.args.use_gradient_checkpointing:
                 self.switti.enable_gradient_checkpointing()

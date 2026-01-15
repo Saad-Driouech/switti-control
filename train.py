@@ -24,6 +24,26 @@ from utils.data_sampler import DistInfiniteBatchSampler
 from utils.fid_score_in_memory import calculate_fid
 from models.switti import SwittiHF
 
+import math
+
+def get_control_strength_schedule(current_iter, warmup_steps=10000):
+    """
+    Ramp control strength from 0→1 over warmup_steps using cosine schedule.
+    
+    Args:
+        current_iter: Current training iteration
+        warmup_steps: Steps to ramp up (default: 10000)
+    
+    Returns:
+        Float in [0, 1]
+    """
+    if current_iter >= warmup_steps:
+        return 1.0
+    
+    progress = current_iter / warmup_steps
+    # Cosine schedule (smoother than linear)
+    return 0.5 * (1 - math.cos(math.pi * progress))
+
 
 DEFAULT_VAE_CKPT = "vae_ch160v4096z32.pth"
 
@@ -389,8 +409,17 @@ def main_training():
         )
         args.cur_lr, args.cur_wd = max_tlr, max_twd
 
+        # Calculate control strength schedule
+        if args.control_encoder_type is not None:
+            control_strength = get_control_strength_schedule(
+                current_iter=cur_iter,
+                warmup_steps=args.control_warmup_steps
+            )
+        else:
+            control_strength = 1.0
+
         # model forward-backward
-        grad_norm, scale_log2 = trainer.train_step(g_it=cur_iter, tb_lg=tb_lg)
+        grad_norm, scale_log2 = trainer.train_step(g_it=cur_iter, tb_lg=tb_lg, control_strength=control_strength)
 
         tb_lg.update(head="AR_opt_lr/lr_min", sche_tlr=min_tlr)
         tb_lg.update(head="AR_opt_lr/lr_max", sche_tlr=max_tlr)
@@ -400,6 +429,8 @@ def main_training():
         if args.tclip > 0:
             tb_lg.update(head="AR_opt_grad/grad", grad_norm=grad_norm)
             tb_lg.update(head="AR_opt_grad/grad", grad_clip=args.tclip)
+        if args.control_encoder_type is not None:
+            tb_lg.update(head="Train", control_strength=control_strength)
 
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
             save_model_state(cur_iter, args, trainer.switti)
