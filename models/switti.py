@@ -59,6 +59,7 @@ class Switti(nn.Module):
         control_context_dim: int = 512,
         control_fusion: str | None = "cross",
         control_pretrained: bool | None = True,
+        control_encoder_ckpt: str | None = None,
     ):
         super().__init__()
         # 0. hyperparameters
@@ -136,6 +137,7 @@ class Switti(nn.Module):
                 control_context_dim=control_context_dim,
                 patch_nums=patch_nums,
                 pretrained=control_pretrained,
+                ckpt_name=control_encoder_ckpt,
             )
         else:
             self.control_encoder = None

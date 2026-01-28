@@ -7,6 +7,8 @@ from typing import Literal, Tuple
 from torchvision import models
 import timm
 
+DEFAULT_VIT_CKPT = "vit_small_patch16_224"
+
 
 # ============================================================
 # -------- CUSTOM ViT BACKBONE (for pretrained=False) --------
@@ -167,6 +169,7 @@ class ViTControlEncoder(nn.Module):
         vit_layers: int = 4,
         heads: int = 8,
         pretrained: bool = False,
+        ckpt_name: str | None = None,
     ):
         super().__init__()
         self.pretrained = pretrained
@@ -174,7 +177,7 @@ class ViTControlEncoder(nn.Module):
 
         if pretrained:
             self.backbone = timm.create_model(
-                "vit_small_patch16_224",
+                ckpt_name if ckpt_name is not None else DEFAULT_VIT_CKPT,
                 pretrained=True,
                 num_classes=0,
                 features_only=False,
@@ -258,6 +261,7 @@ class MultiScaleControlEncoder(nn.Module):
         control_context_dim: int = 512,
         patch_nums: Tuple[int, ...] = (1, 2, 3, 4, 6, 9, 13, 18, 24, 32),
         pretrained: bool = False,
+        ckpt_name: str | None = None,
     ):
         super().__init__()
         self.encoder_type = encoder_type
@@ -274,6 +278,7 @@ class MultiScaleControlEncoder(nn.Module):
             self.encoder = ViTControlEncoder(
                 out_dim=control_context_dim,
                 pretrained=pretrained,
+                ckpt_name=ckpt_name,
             )
         else:
             raise ValueError(f"Invalid encoder_type: {encoder_type}")
@@ -319,6 +324,7 @@ class ControlEncoder(nn.Module):
         control_context_dim: int = 512,
         patch_nums: Tuple[int, ...] = (1, 2, 3, 4, 6, 9, 13, 18, 24, 32),
         pretrained: bool = False,
+        ckpt_name: str | None = None,
     ):
         super().__init__()
         self.encoder = MultiScaleControlEncoder(
@@ -326,6 +332,7 @@ class ControlEncoder(nn.Module):
             control_context_dim=control_context_dim,
             patch_nums=patch_nums,
             pretrained=pretrained,
+            ckpt_name=ckpt_name,
         )
 
     def forward(self, img):

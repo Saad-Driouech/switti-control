@@ -218,6 +218,7 @@ def build_everything(args: arg_util.Args):
         control_context_dim=args.control_context_dim,
         control_fusion=args.control_fusion,
         control_pretrained=args.control_pretrained,
+        control_encoder_ckpt=args.control_encoder_ckpt,
     )
 
     if args.control_encoder_type:
