@@ -115,6 +115,7 @@ def apply_control_only_freeze(
             ".cross_attention_control_norm",
             ".attention_control_norm",
             ".control_proj",
+            ".control_gate",
         )
         if any(tok in clean for tok in control_fusion_tokens):
             keep = True

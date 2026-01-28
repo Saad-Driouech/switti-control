@@ -406,10 +406,36 @@ class SwittiTrainer(object):
                     batch_width=batch_width,
                     control_dict=control_dict
                 )
-                loss = self.train_loss(logits_BLV.view(-1, V),
+                ce_loss = self.train_loss(logits_BLV.view(-1, V),
                                        gt_BL.view(-1),
                                        ).view(B, -1)
-                loss = loss.mul(self.loss_weight).sum(dim=-1).mean()
+                ce_loss = ce_loss.mul(self.loss_weight).sum(dim=-1).mean()
+
+                # NEW: Gate regularization
+                gate_penalty = 0.0
+                gate_count = 0
+                gate_target = 0.6  # Maximum allowed gate value
+                
+                for block in self.switti_wo_ddp.blocks:
+                    if hasattr(block, 'control_gate') and block.control_gate is not None:
+                        gate_value = torch.sigmoid(block.control_gate)
+                        # Only penalize gates above target
+                        gate_penalty += F.relu(gate_value - gate_target) ** 2
+                        gate_count += 1
+                
+                if gate_count > 0:
+                    gate_penalty = gate_penalty / gate_count
+                
+                # Combined loss
+                loss = ce_loss + self.args.gate_reg_weight * gate_penalty
+
+                # Log gate penalty
+                if dist.is_master() and g_it % self.args.log_iters == 0:
+                    tb_lg.update(
+                        head="Train",
+                        gate_penalty=gate_penalty.item(),
+                        step=g_it
+                )
 
             # backward
             is_stepping = (accum_iter + 1) == self.grad_accum

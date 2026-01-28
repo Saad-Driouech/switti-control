@@ -118,6 +118,9 @@ class Args(Tap):
     control_pretrained: bool = False        # whether to use pretrained control encoder
     freeze_switti_backbone: bool = True    # whether to freeze switti backbone and train the encoder only
     control_types: Union[str, List[str], None] = None  # None, single value, or comma separated string which will be later processed into a list
+    control_warmup_steps: int = 10000      # number of steps to warm up control signal strength
+    control_encoder_ckpt: str | None = None  # name of the pretrained control encoder to use
+    gate_reg_weight: float = 0.0        # weight for control gate regularization loss
     
     # Optimization
     fp16: int = 0  # 1: using fp16, 2: bf16

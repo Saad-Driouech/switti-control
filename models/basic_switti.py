@@ -410,7 +410,7 @@ class AdaLNSelfCrossAttn(nn.Module):
                 qk_norm=qk_norm,
             )
             # Learnable control gate
-            self.control_gate = nn.Parameter(torch.tensor(-2.0))
+            self.control_gate = nn.Parameter(torch.tensor([-2.0]))
         else:
             self.cross_attn_control = None
             self.control_gate = None
