@@ -10,6 +10,8 @@ from PIL import Image
 from tqdm.auto import tqdm
 import dist
 
+from utils.control_metrics import calculate_control_metrics
+
 
 @torch.no_grad()
 def calc_pick_or_clip_scores(model, image_inputs, text_inputs, batch_size=50):
@@ -203,18 +205,39 @@ def distributed_metrics_with_csv(
         local_prompts.extend(texts)
 
     local_images = torch.stack(local_images).cuda()
+    
+    pil_images = [to_PIL_image(image) for image in local_images.clone()]
 
     local_pick_score, local_clip_score, local_image_reward = calculate_scores(
-        [to_PIL_image(image) for image in local_images.clone()],
+        pil_images,
         local_prompts,
         device=dist.get_device(),
         clip_model_name_or_path=args.clip_model_name_or_path,
         pickscore_model_name_or_path=args.pickscore_model_name_or_path,
         image_reward_path=args.image_reward_path,
     )
+
+    # NEW: Control-specific metrics
+    control_metrics = {}
+    if control_path is not None and args.control_types:
+        # Collect all control images used during generation
+        # (Need to save them during generation - see Step 3)
+        
+        for ctrl_type in args.control_types:
+            ctrl_metrics = calculate_control_metrics(
+                pil_images,
+                control_dict_batch,  # From generation
+                ctrl_type
+            )
+            control_metrics.update({f"{ctrl_type}_{k}": v for k, v in ctrl_metrics.items()})
+    
+    # Convert control metrics to tensors
+    local_control_metric_tensors = {
+        k: torch.tensor(v).cuda() for k, v in control_metrics.items()
+    }
     # Done.
     dist.barrier()
-    return local_images, local_pick_score, local_clip_score, local_image_reward
+    return local_images, local_pick_score, local_clip_score, local_image_reward, local_control_metric_tensors
 
 
 def save_images(images, prompts, save_path):

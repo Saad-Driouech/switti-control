@@ -15,7 +15,7 @@ import dist
 from calculate_metrics import distributed_metrics_with_csv, to_PIL_image
 from models import Switti, VQVAE, VQVAEHF, build_models
 from models.basic_switti import AdaLNSelfCrossAttn
-from utils import arg_util, misc
+from utils import arg_util, control_metrics, misc
 from utils.amp_sc import AmpOptimizer
 from utils.fsdp import load_model_state, save_model_state
 from utils.lr_control import filter_params, lr_wd_annealing
@@ -447,7 +447,7 @@ def main_training():
                     control_images_path = None
 
                 with FSDP.summon_full_params(trainer.switti, writeback=False):
-                    local_images, local_pick_score, local_clip_score, local_image_reward = distributed_metrics_with_csv(
+                    local_images, local_pick_score, local_clip_score, local_image_reward, local_control_metrics = distributed_metrics_with_csv(
                         trainer.pipe,
                         eval_prompts_path,
                         control_images_path,
@@ -462,6 +462,11 @@ def main_training():
 
                 dist.allreduce(local_image_reward)
                 image_reward = local_image_reward.item() / dist.get_world_size()
+
+                control_metrics = {}
+                for metric_name, metric_tensor in local_control_metrics.items():
+                    dist.allreduce(metric_tensor)
+                    control_metrics[metric_name] = metric_tensor.item() / dist.get_world_size()
 
                 gathered_images = dist.allgather(local_images)
                 images = [to_PIL_image(image) for image in gathered_images]
@@ -478,6 +483,7 @@ def main_training():
                         "Pickscore": pick_score,
                         "ImageReward": image_reward,
                     }
+                    eval_metrics.update(control_metrics)
                     tb_lg.update(
                         head=f"{eval_set_name}_metrics_top_k={args.top_k}_top_p={args.top_p}_cfg={args.guidance}",
                         **eval_metrics,
