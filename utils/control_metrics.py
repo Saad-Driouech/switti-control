@@ -5,130 +5,241 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
-from skimage.color import rgb2gray
 import cv2
 
 
-def calculate_ssim(generated_images, control_images):
+# ============================================================
+# NORMALIZATION & CONVERSION UTILITIES
+# ============================================================
+
+def _tensor_to_pil(tensor):
     """
-    Calculate SSIM between generated and control images.
-    For grayscale control.
+    Convert tensor in [-1, 1] to PIL Image in RGB [0, 255] uint8.
+    
+    NO HEURISTICS. Assumes tensor is ALWAYS in [-1, 1] (from training pipeline).
     
     Args:
-        generated_images: List of PIL Images (512×512)
-        control_images: List of PIL Images (variable size)
+        tensor: Tensor (C, H, W) or (1, C, H, W) in float32 [-1, 1]
+        
+    Returns:
+        PIL Image in RGB mode, uint8 [0, 255]
+    """
+    # Remove batch dimension if present
+    if tensor.ndim == 4:
+        if tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)  # (1, C, H, W) -> (C, H, W)
+        else:
+            raise ValueError(f"Cannot convert batched tensor: {tensor.shape}")
+    
+    if tensor.ndim != 3:
+        raise ValueError(f"Expected (C, H, W) tensor, got {tensor.shape}")
+    
+    # [-1, 1] → [0, 1]
+    tensor = (tensor + 1.0) / 2.0
+    tensor = tensor.clamp(0, 1)
+    
+    # Convert to numpy HWC [0, 255] uint8
+    tensor = tensor.detach().cpu()
+    img_np = (tensor.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    
+    # Handle grayscale (C=1)
+    if img_np.shape[2] == 1:
+        img_np = img_np.squeeze(2)  # (H, W, 1) -> (H, W)
+        return Image.fromarray(img_np, mode='L').convert('RGB')
+    else:
+        return Image.fromarray(img_np, mode='RGB')
+
+
+def _ensure_pil(img):
+    """
+    Ensure input is PIL Image.
+    
+    For generated images: Already PIL, just return.
+    For control images: Convert from tensor.
+    
+    Args:
+        img: PIL Image or Tensor
+        
+    Returns:
+        PIL Image in RGB mode
+    """
+    if isinstance(img, Image.Image):
+        return img.convert('RGB')
+    elif isinstance(img, torch.Tensor):
+        return _tensor_to_pil(img)
+    else:
+        raise TypeError(f"Expected PIL Image or Tensor, got {type(img)}")
+
+
+# ============================================================
+# GRAYSCALE CONTROL METRICS
+# ============================================================
+
+def calculate_ssim(generated_images, control_images):
+    """
+    Calculate SSIM between generated and control images in grayscale domain.
+    
+    Args:
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
     
     Returns:
-        float: Mean SSIM score [0, 1], higher is better
+        float: Mean SSIM score [0, 1], higher is better (1.0 = perfect match)
     """
     ssim_scores = []
     
     for gen_img, ctrl_img in zip(generated_images, control_images):
         if ctrl_img is None:
             continue
-            
-        # Convert to grayscale numpy arrays
-        if isinstance(gen_img, Image.Image):
-            gen_gray = np.array(gen_img.convert('L'))
-        else:
-            gen_gray = (rgb2gray(np.array(gen_img.convert('RGB'))) * 255).astype(np.uint8)
-            
-        if isinstance(ctrl_img, Image.Image):
-            # Resize control to match generated size
-            ctrl_resized = ctrl_img.resize(gen_img.size, Image.BILINEAR)
-            ctrl_gray = np.array(ctrl_resized.convert('L'))
-        else:
-            ctrl_gray = (rgb2gray(np.array(ctrl_img.convert('RGB'))) * 255).astype(np.uint8)
         
-        # Ensure same shape
-        if gen_gray.shape != ctrl_gray.shape:
-            # Fallback resize
-            from skimage.transform import resize as sk_resize
-            ctrl_gray = (sk_resize(ctrl_gray, gen_gray.shape, anti_aliasing=True) * 255).astype(np.uint8)
+        # Ensure both are PIL RGB [0, 255] uint8
+        gen_img = _ensure_pil(gen_img)
+        ctrl_img = _ensure_pil(ctrl_img)
+        
+        # Convert to grayscale numpy arrays
+        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)  # [0, 255]
+        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)  # [0, 255]
         
         # Calculate SSIM
-        score = ssim(gen_gray, ctrl_gray, data_range=255)
+        score = ssim(
+            gen_gray, 
+            ctrl_gray, 
+            data_range=255.0,
+            gaussian_weights=True,
+            use_sample_covariance=False
+        )
         ssim_scores.append(score)
     
-    if len(ssim_scores) == 0:
-        return 0.0
-    
-    return float(np.mean(ssim_scores))
+    return float(np.mean(ssim_scores)) if ssim_scores else 0.0
 
 
-def calculate_edge_similarity(generated_images, control_images, threshold1=50, threshold2=150):
+# ============================================================
+# CANNY EDGE CONTROL METRICS
+# ============================================================
+
+def calculate_edge_similarity(generated_images, control_images, threshold1=100, threshold2=200):
     """
-    Calculate edge similarity for canny control.
-    Measures how well generated edges match control edges.
+    Calculate edge IoU for canny edge control.
     
     Args:
-        generated_images: List of PIL Images (512×512)
-        control_images: List of PIL Images (variable size, canny edge maps)
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
+        threshold1, threshold2: Canny edge detection thresholds
     
     Returns:
-        float: Edge matching score [0, 1], higher is better
+        float: Edge IoU score [0, 1], higher is better
     """
     edge_scores = []
     
     for gen_img, ctrl_img in zip(generated_images, control_images):
         if ctrl_img is None:
             continue
-            
-        # Convert generated to numpy
-        gen_np = np.array(gen_img.convert('RGB'))
         
-        # Resize control to match generated size
-        ctrl_resized = ctrl_img.resize(gen_img.size, Image.BILINEAR)
-        ctrl_np = np.array(ctrl_resized.convert('L'))
+        # Ensure both are PIL RGB [0, 255] uint8
+        gen_img = _ensure_pil(gen_img)
+        ctrl_img = _ensure_pil(ctrl_img)
         
         # Extract edges from generated image
+        gen_np = np.array(gen_img.convert('RGB'))
         gen_gray = cv2.cvtColor(gen_np, cv2.COLOR_RGB2GRAY)
         gen_edges = cv2.Canny(gen_gray, threshold1, threshold2)
         
-        # Control is already edge map (normalize to 0-255 if needed)
-        ctrl_edges = ctrl_np
-        if ctrl_edges.max() <= 1.0:
-            ctrl_edges = (ctrl_edges * 255).astype(np.uint8)
+        # Convert control to grayscale edge map
+        ctrl_gray = np.array(ctrl_img.convert('L'))
         
-        # Ensure same shape (should be guaranteed after resize)
-        if gen_edges.shape != ctrl_edges.shape:
-            from skimage.transform import resize as sk_resize
-            ctrl_edges = (sk_resize(ctrl_edges, gen_edges.shape, anti_aliasing=True) * 255).astype(np.uint8)
+        # Binarize both (non-zero = edge)
+        gen_binary = (gen_edges > 0).astype(bool)
+        ctrl_binary = (ctrl_gray > 127).astype(bool)  # Threshold at mid-gray
         
-        # Calculate IoU (Intersection over Union) of edges
-        gen_binary = gen_edges > 0
-        ctrl_binary = ctrl_edges > 0
-        
+        # Calculate IoU
         intersection = np.logical_and(gen_binary, ctrl_binary).sum()
         union = np.logical_or(gen_binary, ctrl_binary).sum()
         
-        if union > 0:
-            iou = intersection / union
-        else:
-            iou = 0.0
-        
+        iou = float(intersection) / float(union) if union > 0 else 0.0
         edge_scores.append(iou)
     
-    if len(edge_scores) == 0:
-        return 0.0
-    
-    return float(np.mean(edge_scores))
+    return float(np.mean(edge_scores)) if edge_scores else 0.0
 
+
+def calculate_edge_f1(generated_images, control_images, threshold1=100, threshold2=200):
+    """
+    Calculate edge F1 score (harmonic mean of precision & recall).
+    
+    Args:
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
+        threshold1, threshold2: Canny thresholds
+    
+    Returns:
+        dict: {'f1': float, 'precision': float, 'recall': float}
+    """
+    f1_scores = []
+    precision_scores = []
+    recall_scores = []
+    
+    for gen_img, ctrl_img in zip(generated_images, control_images):
+        if ctrl_img is None:
+            continue
+        
+        # Ensure both are PIL RGB [0, 255] uint8
+        gen_img = _ensure_pil(gen_img)
+        ctrl_img = _ensure_pil(ctrl_img)
+        
+        # Extract edges from generated
+        gen_np = np.array(gen_img.convert('RGB'))
+        gen_gray = cv2.cvtColor(gen_np, cv2.COLOR_RGB2GRAY)
+        gen_edges = cv2.Canny(gen_gray, threshold1, threshold2)
+        
+        # Convert control to grayscale edge map
+        ctrl_gray = np.array(ctrl_img.convert('L'))
+        
+        # Binarize both
+        gen_binary = (gen_edges > 0).astype(bool)
+        ctrl_binary = (ctrl_gray > 127).astype(bool)
+        
+        # True positives, false positives, false negatives
+        tp = np.logical_and(gen_binary, ctrl_binary).sum()
+        fp = np.logical_and(gen_binary, ~ctrl_binary).sum()
+        fn = np.logical_and(~gen_binary, ctrl_binary).sum()
+        
+        # Precision and Recall
+        precision = float(tp) / float(tp + fp) if (tp + fp) > 0 else 0.0
+        recall = float(tp) / float(tp + fn) if (tp + fn) > 0 else 0.0
+        
+        # F1 score
+        f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        f1_scores.append(f1)
+        precision_scores.append(precision)
+        recall_scores.append(recall)
+    
+    if not f1_scores:
+        return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+    
+    return {
+        'f1': float(np.mean(f1_scores)),
+        'precision': float(np.mean(precision_scores)),
+        'recall': float(np.mean(recall_scores)),
+    }
+
+
+# ============================================================
+# DEPTH CONTROL METRICS
+# ============================================================
 
 def calculate_depth_correlation(generated_images, control_images):
     """
-    Calculate depth correlation for depth control.
-    Measures structural similarity in depth space.
+    Calculate depth correlation (Pearson correlation).
     
-    Note: This function requires MiDaS model to be loaded.
-    For now, we'll implement a simpler version using grayscale correlation.
+    This is the ONLY mathematically sound depth metric when using grayscale as proxy.
+    Correlation is scale-invariant, so independent normalization is fine.
     
     Args:
-        generated_images: List of PIL Images (512×512)
-        control_images: List of PIL Images (variable size, depth maps)
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
     
     Returns:
-        float: Depth correlation score [0, 1], higher is better
+        float: Pearson correlation [0, 1], higher is better
     """
     correlations = []
     
@@ -136,43 +247,109 @@ def calculate_depth_correlation(generated_images, control_images):
         if ctrl_img is None:
             continue
         
-        # Simple version: treat depth maps as grayscale and compute correlation
-        # (Full version would use MiDaS to estimate depth from generated image)
+        # Ensure both are PIL RGB [0, 255] uint8
+        gen_img = _ensure_pil(gen_img)
+        ctrl_img = _ensure_pil(ctrl_img)
         
-        # Convert generated to grayscale (proxy for depth)
-        gen_gray = np.array(gen_img.convert('L')).astype(np.float32) / 255.0
+        # Convert to grayscale [0, 255] uint8
+        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)
+        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)
         
-        # Resize control to match generated size
-        ctrl_resized = ctrl_img.resize(gen_img.size, Image.BILINEAR)
-        ctrl_gray = np.array(ctrl_resized.convert('L')).astype(np.float32) / 255.0
-        
-        # Ensure same shape
-        if gen_gray.shape != ctrl_gray.shape:
-            from skimage.transform import resize as sk_resize
-            ctrl_gray = sk_resize(ctrl_gray, gen_gray.shape, anti_aliasing=True)
-        
-        # Normalize both to [0, 1]
+        # Normalize independently (OK for correlation, which is scale-invariant)
         gen_norm = (gen_gray - gen_gray.min()) / (gen_gray.max() - gen_gray.min() + 1e-8)
         ctrl_norm = (ctrl_gray - ctrl_gray.min()) / (ctrl_gray.max() - ctrl_gray.min() + 1e-8)
         
-        # Calculate correlation
+        # Calculate Pearson correlation
         correlation = np.corrcoef(gen_norm.flatten(), ctrl_norm.flatten())[0, 1]
-        correlations.append(max(0, correlation))  # Clip negative correlations to 0
+        
+        # Clip to [0, 1] (negative correlation = bad)
+        correlations.append(max(0.0, correlation))
     
-    if len(correlations) == 0:
-        return 0.0
-    
-    return float(np.mean(correlations))
+    return float(np.mean(correlations)) if correlations else 0.0
 
 
-def calculate_control_metrics(generated_images, control_dict, control_type):
+def calculate_depth_mae(generated_images, control_images):
     """
-    Dispatcher function - calls appropriate metric based on control type.
+    Calculate Mean Absolute Error in the SHARED [0, 255] space.
+    
+    This preserves scale information by NOT normalizing independently.
+    Both images are converted to grayscale [0, 255], then MAE is computed directly.
     
     Args:
-        generated_images: List of PIL Images (512×512)
-        control_dict: Dict {control_type: [PIL Images]}
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
+    
+    Returns:
+        float: MAE in [0, 1] range, lower is better (0 = perfect match)
+    """
+    mae_scores = []
+    
+    for gen_img, ctrl_img in zip(generated_images, control_images):
+        if ctrl_img is None:
+            continue
+        
+        # Ensure both are PIL RGB [0, 255] uint8
+        gen_img = _ensure_pil(gen_img)
+        ctrl_img = _ensure_pil(ctrl_img)
+        
+        # Convert to grayscale [0, 255] - SAME SCALE, NO INDEPENDENT NORMALIZATION
+        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)
+        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)
+        
+        # Calculate MAE in shared [0, 255] space
+        mae = np.mean(np.abs(gen_gray - ctrl_gray))
+        mae_scores.append(mae)
+    
+    return float(np.mean(mae_scores) / 255.0) if mae_scores else 0.0
+
+
+def calculate_depth_rmse(generated_images, control_images):
+    """
+    Calculate RMSE in the SHARED [0, 255] space.
+    
+    This preserves scale information by NOT normalizing independently.
+    
+    Args:
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
+    
+    Returns:
+        float: RMSE in [0, 1] range, lower is better (0 = perfect match)
+    """
+    rmse_scores = []
+    
+    for gen_img, ctrl_img in zip(generated_images, control_images):
+        if ctrl_img is None:
+            continue
+        
+        # Ensure both are PIL RGB [0, 255] uint8
+        gen_img = _ensure_pil(gen_img)
+        ctrl_img = _ensure_pil(ctrl_img)
+        
+        # Convert to grayscale [0, 255] - SAME SCALE
+        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)
+        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)
+        
+        # Calculate RMSE in shared [0, 255] space
+        rmse = np.sqrt(np.mean((gen_gray - ctrl_gray) ** 2))
+        rmse_scores.append(rmse)
+    
+    return float(np.mean(rmse_scores) / 255.0) if rmse_scores else 0.0
+
+
+# ============================================================
+# DISPATCHER FUNCTION
+# ============================================================
+
+def calculate_control_metrics(generated_images, control_dict, control_type, device='cuda'):
+    """
+    Dispatcher function - calls appropriate metrics based on control type.
+    
+    Args:
+        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
+        control_dict: Dict {control_type: List[Tensor(3,512,512, float32 [-1,1])]}
         control_type: str, one of ['gray', 'canny', 'depth']
+        device: torch device (unused, for future LPIPS support)
     
     Returns:
         dict: {metric_name: score}
@@ -185,25 +362,44 @@ def calculate_control_metrics(generated_images, control_dict, control_type):
     # Filter out None values
     valid_pairs = [(g, c) for g, c in zip(generated_images, control_images) if c is not None]
     
-    if len(valid_pairs) == 0:
+    if not valid_pairs:
         return {}
     
     valid_gen, valid_ctrl = zip(*valid_pairs)
+    valid_gen = list(valid_gen)
+    valid_ctrl = list(valid_ctrl)
     
     metrics = {}
     
     try:
         if control_type == 'gray':
-            metrics['ssim'] = calculate_ssim(list(valid_gen), list(valid_ctrl))
+            # Structural similarity in grayscale domain
+            metrics['ssim'] = calculate_ssim(valid_gen, valid_ctrl)
         
-        if control_type == 'canny':
-            metrics['edge_similarity'] = calculate_edge_similarity(list(valid_gen), list(valid_ctrl))
+        elif control_type == 'canny':
+            # Edge IoU (primary metric)
+            metrics['edge_iou'] = calculate_edge_similarity(valid_gen, valid_ctrl)
+            
+            # Edge F1, precision, recall (diagnostic metrics)
+            edge_f1_results = calculate_edge_f1(valid_gen, valid_ctrl)
+            metrics['edge_f1'] = edge_f1_results['f1']
+            metrics['edge_precision'] = edge_f1_results['precision']
+            metrics['edge_recall'] = edge_f1_results['recall']
         
-        if control_type == 'depth':
-            metrics['depth_correlation'] = calculate_depth_correlation(list(valid_gen), list(valid_ctrl))
+        elif control_type == 'depth':
+            # Correlation (primary metric - scale-invariant, mathematically sound)
+            metrics['depth_corr'] = calculate_depth_correlation(valid_gen, valid_ctrl)
+            
+            # MAE (secondary metric - preserves scale)
+            metrics['depth_mae'] = calculate_depth_mae(valid_gen, valid_ctrl)
+            
+            # RMSE (secondary metric - preserves scale, penalizes large errors more)
+            metrics['depth_rmse'] = calculate_depth_rmse(valid_gen, valid_ctrl)
+    
     except Exception as e:
-        print(f"[WARNING] Control metric calculation failed for {control_type}: {e}")
-        # Return empty dict on error
+        print(f"[ERROR] Control metric calculation failed for {control_type}: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
     
     return metrics
