@@ -21,6 +21,7 @@ from models import Switti, VQVAE
 from models.pipeline import SwittiPipeline
 from utils.amp_sc import AmpOptimizer
 from utils.misc import TensorboardLogger
+from utils.perceptual_loss import PerceptualLoss, compute_gate_regularization
 
 Ten = torch.Tensor
 FTen = torch.Tensor
@@ -59,15 +60,16 @@ def generate_logging_prompts_captions(
     control_path: str | None,
     control_types: list[str] | None,
     num_select: int = 12,
+    final_reso: int = 512,
+    mid_reso: float = 1.125,
 ) -> tuple[list[str], list[str], dict[str, list[Image.Image] | None]]:
     """
     Select files from missing files list, fetch captions from COCO captions JSON,
     and load control images for each control type.
 
     Returns:
-        selected_filenames: list of selected filenames (str)
         selected_captions: list of corresponding captions (str)
-        control_dict_batch: dict mapping control_type -> list of PIL images or None
+        control_dict_batch: dict mapping control_type -> Tensor (N, 3, H, W) in [-1, 1]
     """
 
     # Load missing filenames
@@ -117,20 +119,40 @@ def generate_logging_prompts_captions(
     control_dict_batch = None
     if control_path is not None and control_types:
         control_dict_batch = {ctrl: [] for ctrl in control_types}
+        
+        # Create transform matching training data
+        from utils.data import JointTransform
+        transform = JointTransform(
+            final_reso=final_reso,
+            mid_reso=mid_reso,
+            hflip_prob=0.0  # No flip for validation
+        )
+        
         for fname in selected_filenames:
             for ctrl in control_types:
                 ctrl_fp = os.path.join(control_path, ctrl, fname)
                 if os.path.exists(ctrl_fp):
                     try:
                         img = Image.open(ctrl_fp).convert("RGB")
+                        # Apply SAME transform as training data
+                        # (dummy dict because transform expects dict input)
+                        _, processed = transform(img, {ctrl: img})
+                        control_dict_batch[ctrl].append(processed[ctrl])
                     except Exception as e:
-                        print(f"[Warning] Failed to open control image {ctrl_fp}: {e}")
-                        img = None
+                        print(f"[Warning] Failed to process control image {ctrl_fp}: {e}")
+                        # Append zero tensor as placeholder
+                        dummy = torch.zeros(3, final_reso, final_reso)
+                        control_dict_batch[ctrl].append(dummy)
                 else:
-                    img = None
-                control_dict_batch[ctrl].append(img)
-
-    # Return
+                    # Missing file: zero tensor
+                    dummy = torch.zeros(3, final_reso, final_reso)
+                    control_dict_batch[ctrl].append(dummy)
+        
+        # Stack into tensors
+        for ctrl in control_types:
+            control_dict_batch[ctrl] = torch.stack(control_dict_batch[ctrl], dim=0)
+            # Shape: (N, 3, H, W) in [-1, 1]
+    
     return selected_captions, control_dict_batch
 
 
@@ -186,26 +208,50 @@ class SwittiTrainer(object):
             captions_json_path=os.path.join(args.data_path, "annotations", "captions_val2014.json"),
             control_path=os.path.join(args.data_path, "val_control"),
             control_types=args.control_types,
+            final_reso=args.data_load_reso,
+            mid_reso=args.mid_reso
         )
         print(f"[Trainer] logging prompts {self.log_prompts}")
-        print(f"[Trainer] logging control dict {self.log_control_dict}")
+        # print(f"[Trainer] logging control dict {self.log_control_dict}")
         df = pd.read_csv("eval_prompts/mjhq.csv")
         self.mjhq_prompts = df["captions"].astype(str).tolist()[:12]
         print(f"[Trainer] MJHQ prompts {self.mjhq_prompts}")
         param = next(self.switti.parameters()).to(self.device)
         self.model_dtype = param.dtype
 
+        # --- Auxiliary losses (optional, CLI-gated) ---
+        self.use_perceptual_loss = getattr(args, "use_perceptual_loss", False)
+        self.perceptual_loss_weight = getattr(args, "perceptual_loss_weight", 0.1)
+        self.perceptual_loss_every_n_steps = getattr(args, "perceptual_loss_every_n_steps", 4)
+        self.perceptual_loss_fn = (
+            PerceptualLoss(
+                lpips_net=getattr(args, "lpips_net", "alex"),
+                target_size=getattr(args, "perceptual_loss_resolution", 256),
+            )
+            if self.use_perceptual_loss else None
+        )
+
+        self.use_control_gate = getattr(args, "use_control_gate", False)
+        self.use_gate_reg = getattr(args, "use_gate_reg", False)
+        self.gate_reg_weight = getattr(args, "gate_reg_weight", 0.1)
+        self.gate_reg_target = getattr(args, "gate_reg_target", 0.6)
+
     # build small control dict for pipe visualization (use up to N images)
     def _build_ctrl_for_pipe(self, ctrl_dict, n):
+        """Build small control dict for pipe visualization (use up to N images)"""
         if ctrl_dict is None:
             return None
+        
         sub = {}
         for k, v in ctrl_dict.items():
             if v is None:
                 sub[k] = None
+            elif isinstance(v, torch.Tensor):
+                # Already preprocessed tensor from training batch or validation set
+                sub[k] = v[:n].cpu()  # Just slice and move to CPU
             else:
-                # v is (B,3,H,W)
-                sub[k] = v[:n].cpu()
+                raise TypeError(f"Expected preprocessed tensor for {k}, got {type(v)}")
+        
         return sub
 
     def _prepare_vis_image(self, item):
@@ -298,7 +344,7 @@ class SwittiTrainer(object):
                 continue
 
             imgs = torch.stack(tensors, dim=0)   # (B,3,H,W)
-            grid = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+            grid = make_grid(imgs, nrow=math.floor(math.sqrt(len(imgs))))
             out[ctrl_type] = grid
 
         return out
@@ -406,36 +452,30 @@ class SwittiTrainer(object):
                     batch_width=batch_width,
                     control_dict=control_dict
                 )
-                ce_loss = self.train_loss(logits_BLV.view(-1, V),
+                loss = self.train_loss(logits_BLV.view(-1, V),
                                        gt_BL.view(-1),
                                        ).view(B, -1)
-                ce_loss = ce_loss.mul(self.loss_weight).sum(dim=-1).mean()
+                loss = loss.mul(self.loss_weight).sum(dim=-1).mean()
 
-                # NEW: Gate regularization
-                gate_penalty = 0.0
-                gate_count = 0
-                gate_target = 0.6  # Maximum allowed gate value
-                
-                for block in self.switti_wo_ddp.blocks:
-                    if hasattr(block, 'control_gate') and block.control_gate is not None:
-                        gate_value = torch.sigmoid(block.control_gate)
-                        # Only penalize gates above target
-                        gate_penalty += F.relu(gate_value - gate_target) ** 2
-                        gate_count += 1
-                
-                if gate_count > 0:
-                    gate_penalty = gate_penalty / gate_count
-                
-                # Combined loss
-                loss = ce_loss + self.args.gate_reg_weight * gate_penalty
+                # --- Gate regularisation (optional) ---
+                if self.use_control_gate:
+                    gate_penalty_val = 0.0          # scalar for logging
+                    if self.use_gate_reg:
+                        gate_penalty = compute_gate_regularization(
+                            self.switti_wo_ddp,
+                            gate_target=self.gate_reg_target,
+                        )
+                        loss = loss + self.gate_reg_weight * gate_penalty
+                        gate_penalty_val = gate_penalty.item()
 
-                # Log gate penalty
-                if dist.is_master() and g_it % self.args.log_iters == 0:
-                    tb_lg.update(
-                        head="Train",
-                        gate_penalty=gate_penalty.item(),
-                        step=g_it
-                )
+                # --- Perceptual loss (optional) ---
+                perceptual_val = 0.0
+                if self.use_perceptual_loss and (g_it % self.perceptual_loss_every_n_steps == 0):
+                    perceptual_loss = self.perceptual_loss_fn(
+                        logits_BLV, gt_idx_Bl, self.vae_local
+                    )
+                    loss = loss + self.perceptual_loss_weight * perceptual_loss
+                    perceptual_val = perceptual_loss.item()
 
             # backward
             is_stepping = (accum_iter + 1) == self.grad_accum
@@ -512,10 +552,9 @@ class SwittiTrainer(object):
                                          top_k=self.args.top_k,
                                          top_p=self.args.top_p,
                                          return_pil=False,
-                                         mid_reso=self.args.mid_reso,
                                          control_dict=ctrl_for_pipe,
                                          )
-                        imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+                        imgs = make_grid(imgs, nrow=math.floor(math.sqrt(len(imgs))))
                         self._log_pipe_outputs(
                             tb_lg,
                             tag_prefix=f"train_topk={self.args.top_k}_topp={self.args.top_p}_cfg={cfg}",
@@ -531,10 +570,9 @@ class SwittiTrainer(object):
                             top_k=self.args.top_k,
                             top_p=self.args.top_p,
                             return_pil=False,
-                            mid_reso=self.args.mid_reso,
                             control_dict=self.log_control_dict,
                         )
-                        imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+                        imgs = make_grid(imgs, nrow=math.floor(math.sqrt(len(imgs))))
                         self._log_pipe_outputs(
                             tb_lg,
                             tag_prefix=f"eval_topk={self.args.top_k}_topp={self.args.top_p}_cfg={cfg}",
@@ -548,10 +586,9 @@ class SwittiTrainer(object):
                         #     top_k=1,
                         #     cfg=cfg,
                         #     return_pil=False,
-                        #     mid_reso=self.args.mid_reso,
                         #     control_dict=self.log_control_dict,
                         # )
-                        # imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+                        # imgs = make_grid(imgs, nrow=math.floor(math.sqrt(len(imgs))))
                         # self._log_pipe_outputs(
                         #     tb_lg,
                         #     tag_prefix=f"eval_topk1_cfg={cfg}",
@@ -567,10 +604,9 @@ class SwittiTrainer(object):
                             top_k=self.args.top_k,
                             top_p=self.args.top_p,
                             return_pil=False,
-                            mid_reso=self.args.mid_reso,
                             control_dict=None,  # T2I, no control
                         )
-                        imgs = make_grid(imgs, nrow=math.ceil(math.sqrt(len(imgs))))
+                        imgs = make_grid(imgs, nrow=math.floor(math.sqrt(len(imgs))))
                         self._log_pipe_outputs(
                             tb_lg,
                             tag_prefix=f"mjhq_t2i_samples_cfg_topk={self.args.top_k}_topp={self.args.top_p}_cfg={cfg}",
@@ -608,6 +644,20 @@ class SwittiTrainer(object):
                             max=max(gate_values),
                             step=g_it
                         )
+
+                # Log auxiliary losses
+                if self.use_control_gate and self.use_gate_reg:
+                    tb_lg.update(
+                        head="Auxiliary_losses",
+                        gate_penalty=gate_penalty_val,
+                        step=g_it,
+                    )
+                if self.use_perceptual_loss:
+                    tb_lg.update(
+                        head="Auxiliary_losses",
+                        perceptual_lpips=perceptual_val,
+                        step=g_it,
+                    )
             print(f"LOGGING {g_it} FINISHED")
             if self.args.use_gradient_checkpointing:
                 self.switti.enable_gradient_checkpointing()
