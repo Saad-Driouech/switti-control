@@ -40,6 +40,7 @@ def build_models(
     control_fusion: str | None = "cross",
     control_pretrained: bool | None = True,
     control_encoder_ckpt: str | None = None,
+    use_control_gate: bool = False,
 ) -> tuple[VQVAE, Switti]:
     heads = depth
     width = depth * 64
@@ -90,6 +91,7 @@ def build_models(
         control_fusion=control_fusion,
         control_pretrained=control_pretrained,
         control_encoder_ckpt=control_encoder_ckpt,
+        use_control_gate=use_control_gate,
     ).to(device)
     
     switti_wo_ddp.init_weights(

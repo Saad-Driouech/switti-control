@@ -118,9 +118,20 @@ class Args(Tap):
     control_pretrained: bool = False        # whether to use pretrained control encoder
     freeze_switti_backbone: bool = True    # whether to freeze switti backbone and train the encoder only
     control_types: Union[str, List[str], None] = None  # None, single value, or comma separated string which will be later processed into a list
-    control_warmup_steps: int = 10000      # number of steps to warm up control signal strength
     control_encoder_ckpt: str | None = None  # name of the pretrained control encoder to use
-    gate_reg_weight: float = 0.0        # weight for control gate regularization loss
+    drop_control_scale: int = 1000  # drop contol after this scale
+
+    # Auxiliary losses (control training)
+    use_perceptual_loss: bool = False       # enable LPIPS perceptual loss (logged; see trainer for backprop option)
+    perceptual_loss_weight: float = 0.1     # weight when backpropped (currently log-only)
+    perceptual_loss_resolution: int = 256   # downsample to this resolution for LPIPS (256 = 4× less memory than 512)
+    perceptual_loss_every_n_steps: int = 4  # compute perceptual loss every N steps (saves memory/compute)
+    lpips_net: str = "alex"                 # LPIPS backbone: "alex" (fast) or "vgg"
+    use_control_gate: bool = False          # whether to use control gates
+    use_gate_reg: bool = False              # enable gate-ceiling regularisation
+    gate_reg_weight: float = 0.1            # weight of gate penalty in total loss
+    gate_reg_target: float = 0.6            # sigmoid ceiling for control gates
+    control_warmup_steps: int = 10000       # cosine ramp 0→1 for control strength
     
     # Optimization
     fp16: int = 0  # 1: using fp16, 2: bf16
@@ -403,10 +414,12 @@ def init_dist_and_get_args():
     bs_per_gpu = round(args.bs / dist.get_world_size() / args.grad_accum)
     args.batch_size = bs_per_gpu
     args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size() * args.grad_accum
-    args.workers = min(max(0, args.workers), args.batch_size)
+    args.workers = min(max(0, args.workers), max(args.batch_size, 4))
 
-    args.tlr = args.tlr if args.tlr is not None else args.tblr * (args.bs / 256)
+    args.tlr = args.tblr
     args.twde = args.twde or args.twd
+
+    args.control_end_si = min(args.drop_control_scale, len(args.patch_nums) + 1) # the scale (inclusive) starting from which to drop control
 
     tb_name = "tb_logs"
     args.tb_log_dir_path = os.path.join(args.local_out_dir_path, tb_name)
