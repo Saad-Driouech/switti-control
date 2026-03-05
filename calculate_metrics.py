@@ -171,23 +171,48 @@ def distributed_metrics_with_csv(
         control_dict_batch = None
 
         if control_path is not None and args.control_types:
-            # Build {ctrl_type : [PIL or None, ...]} matching batch length
+            from utils.data import JointTransform
+            transform = JointTransform(
+                final_reso=args.data_load_reso,
+                mid_reso=args.mid_reso,
+                hflip_prob=0.0,  # deterministic for eval
+            )
+
             control_dict_batch = {ctrl: [] for ctrl in args.control_types}
 
             for fname in filenames_batch:
+                fname = str(fname)
                 for _ in range(args.num_images_for_metrics):
                     for ctrl in args.control_types:
+                        # Handle missing filename
                         if fname == "None":
-                            control_dict_batch[ctrl].append(None)
+                            dummy = torch.zeros(3, args.final_reso, args.final_reso)
+                            control_dict_batch[ctrl].append(dummy)
                             continue
 
-                        fname = fname.replace(".jpg", ".png")
-                        ctrl_fp = os.path.join(control_path, ctrl, fname)
+                        fname_png = fname.replace(".jpg", ".png")
+                        ctrl_fp = os.path.join(control_path, ctrl, fname_png)
 
                         if os.path.exists(ctrl_fp):
-                            control_dict_batch[ctrl].append(Image.open(ctrl_fp))
+                            try:
+                                img = Image.open(ctrl_fp).convert("RGB")
+
+                                # Apply SAME transform used in training
+                                _, processed = transform(img, {ctrl: img})
+                                control_tensor = processed[ctrl]
+
+                                control_dict_batch[ctrl].append(control_tensor)
+                            except Exception as e:
+                                print(f"[Warning] Failed to process {ctrl_fp}: {e}")
+                                dummy = torch.zeros(3, args.final_reso, args.final_reso)
+                                control_dict_batch[ctrl].append(dummy)
                         else:
-                            control_dict_batch[ctrl].append(None)
+                            dummy = torch.zeros(3, args.final_reso, args.final_reso)
+                            control_dict_batch[ctrl].append(dummy)
+
+            # Stack into tensors (N, 3, H, W)
+            for ctrl in args.control_types:
+                control_dict_batch[ctrl] = torch.stack(control_dict_batch[ctrl], dim=0)
         
         image_tensors = pipe(
             prompt=texts,
@@ -197,8 +222,8 @@ def distributed_metrics_with_csv(
             top_p=args.top_p,
             more_smooth=False,
             return_pil=False,
-            mid_reso=args.mid_reso,
             control_dict=control_dict_batch,
+            control_end_si=args.control_end_si,
         )
 
         local_images.extend(image_tensors)
@@ -227,7 +252,8 @@ def distributed_metrics_with_csv(
             ctrl_metrics = calculate_control_metrics(
                 pil_images,
                 control_dict_batch,  # From generation
-                ctrl_type
+                ctrl_type,
+                device=dist.get_device(),  # Pass device for LPIPS
             )
             control_metrics.update({f"{ctrl_type}_{k}": v for k, v in ctrl_metrics.items()})
     
