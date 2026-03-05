@@ -163,6 +163,7 @@ class CrossAttention(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         qk_norm: bool = False,
+        append_on_cache: bool = False
     ):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -188,6 +189,7 @@ class CrossAttention(nn.Module):
         self.attn_drop = attn_drop
 
         # only used during inference
+        self.append_on_cache = append_on_cache
         self.caching, self.cached_k, self.cached_v = False, None, None
 
     def kv_caching(self, enable: bool):
@@ -196,7 +198,7 @@ class CrossAttention(nn.Module):
     def forward(self, x, context, context_attn_bias=None, freqs_cis=None):
         B, L, C = x.shape
         context_B, context_L, context_C = context.shape
-        assert B == context_B
+        assert B == context_B, f"Shape mismatch: x batch {x.shape} vs context batch {context.shape}"
 
         q = self.to_q(x).view(B, L, -1)  # BLD , self.num_heads, self.head_dim)
         if self.qk_norm:
@@ -223,6 +225,23 @@ class CrossAttention(nn.Module):
                 self.cached_k = k
                 self.cached_v = v
         else:
+            # Cache exists — behaviour differs by use case:
+            # - Text: context_L is same every scale, we just reuse (no append)
+            # - Control in AR mode: we append new scale's K/V to accumulate cross-scale context
+            if self.append_on_cache and self.caching:
+                # AR control: compute new K/V and append to cache
+                kv = self.to_kv(context).view(B, context_L, 2, -1)
+                k, v = kv.permute(2, 0, 1, 3).unbind(dim=0)
+
+                if self.qk_norm:
+                    k = self.k_norm(k)
+
+                k = k.view(B, context_L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+                v = v.view(B, context_L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+                self.cached_k = torch.cat((self.cached_k, k), dim=2)  # grow along sequence dim
+                self.cached_v = torch.cat((self.cached_v, v), dim=2)
+
             k = self.cached_k
             v = self.cached_v
 
@@ -361,6 +380,7 @@ class AdaLNSelfCrossAttn(nn.Module):
         use_swiglu_ffn=False,
         norm_eps=1e-6,
         use_crop_cond=False,
+        use_control_gate: bool = False,
     ):
         """
         control_fusion:
@@ -408,9 +428,13 @@ class AdaLNSelfCrossAttn(nn.Module):
                 attn_drop=attn_drop,
                 proj_drop=drop,
                 qk_norm=qk_norm,
+                append_on_cache=True,  # accumulate across scales in AR mode
             )
             # Learnable control gate
-            self.control_gate = nn.Parameter(torch.tensor([-2.0]))
+            if use_control_gate:
+                self.control_gate = nn.Parameter(torch.tensor([-2.0]))
+            else:
+                self.control_gate = None
         else:
             self.cross_attn_control = None
             self.control_gate = None
@@ -522,8 +546,11 @@ class AdaLNSelfCrossAttn(nn.Module):
                         freqs_cis=freqs_cis,
                     )
                     # Apply learned gate (sigmoid to keep in [0,1])
-                    gate = torch.sigmoid(self.control_gate)
-                    x = x + gate * self.cross_attention_control_norm2(control_out)
+                    if self.control_gate is not None:
+                        gate = torch.sigmoid(self.control_gate)
+                        x = x + gate * self.cross_attention_control_norm2(control_out)
+                    else:
+                        x = x + self.cross_attention_control_norm2(control_out)
                 elif self.control_fusion == "add" and self.control_proj is not None:
                     # Additive fusion:
                     proj = self.control_proj(normed_ctrl).type_as(x)

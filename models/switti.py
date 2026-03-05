@@ -60,6 +60,7 @@ class Switti(nn.Module):
         control_fusion: str | None = "cross",
         control_pretrained: bool | None = True,
         control_encoder_ckpt: str | None = None,
+        use_control_gate: bool = False,
     ):
         super().__init__()
         # 0. hyperparameters
@@ -142,6 +143,17 @@ class Switti(nn.Module):
         else:
             self.control_encoder = None
 
+        # --- learnable null control tokens (for CFG unconditional branch) ---
+        if control_encoder_type is not None:
+            self.null_control_tokens = nn.ParameterDict()
+            for pn in self.patch_nums:
+                L = pn * pn
+                self.null_control_tokens[str(pn)] = nn.Parameter(
+                    torch.randn(1, L, self.control_context_dim) * 0.02
+                )
+        else:
+            self.null_control_tokens = None
+
         # 4. backbone blocks
         self.drop_path_rate = drop_path_rate
         # stochastic depth decay rule (linearly increasing)
@@ -166,6 +178,7 @@ class Switti(nn.Module):
                     use_swiglu_ffn=use_swiglu_ffn,
                     norm_eps=norm_eps,
                     use_crop_cond=use_crop_cond,
+                    use_control_gate=use_control_gate,
                 )
             )
 
@@ -317,6 +330,12 @@ class Switti(nn.Module):
                 
                 # --- TRAINING: Concatenate all scales ---
                 if self.training:
+                    if torch.rand(1).item() < 0.1:
+                        ctrl_ms = {
+                            pn: self.null_control_tokens[str(pn)].expand(B, -1, -1)
+                            for pn in self.patch_nums
+                        }
+
                     ctrl_tokens_list = []
                     
                     # Add SOS dummy token (to match x_BLC which has SOS)
@@ -439,6 +458,8 @@ class Switti(nn.Module):
         for block in self.blocks:
             block.attn.proj.weight.data.div_(math.sqrt(2 * depth))
             block.cross_attn.proj.weight.data.div_(math.sqrt(2 * depth))
+            if block.cross_attn_control is not None:
+                block.cross_attn_control.proj.weight.data.div_(math.sqrt(2 * depth))
             if hasattr(block.ffn, "fc2"):
                 block.ffn.fc2.weight.data.div_(math.sqrt(2 * depth))
 

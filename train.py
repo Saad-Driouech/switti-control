@@ -108,6 +108,10 @@ def apply_control_only_freeze(
                 # BUT allow projection heads to stay trainable if asked
                 if ".proj" in clean or clean.endswith("proj"):
                     keep = True
+        
+        # 1.5) Keep learnable null control tokens
+        if clean.startswith("null_control_tokens"):
+            keep = True
 
         # 2) Allow specific control-fusion modules inside transformer blocks
         control_fusion_tokens = (
@@ -219,6 +223,7 @@ def build_everything(args: arg_util.Args):
         control_fusion=args.control_fusion,
         control_pretrained=args.control_pretrained,
         control_encoder_ckpt=args.control_encoder_ckpt,
+        use_control_gate=args.use_control_gate,
     )
 
     if args.control_encoder_type:
