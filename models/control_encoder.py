@@ -187,10 +187,9 @@ class ViTControlEncoder(nn.Module):
             self.patch_size = self.backbone.patch_embed.patch_size[0]
 
             # Add ImageNet normalization constants
-            self.register_buffer('imagenet_mean', 
-                torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-            self.register_buffer('imagenet_std', 
-                torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            config = self.backbone.default_cfg
+            self.register_buffer('imagenet_mean', torch.tensor(config['mean']).view(1, 3, 1, 1))
+            self.register_buffer('imagenet_std', torch.tensor(config['std']).view(1, 3, 1, 1))
 
         else:
             self.backbone = CustomViTBackbone(
@@ -296,17 +295,28 @@ class MultiScaleControlEncoder(nn.Module):
 
         # Extract spatial features
         features = self.encoder(img)  # (B, control_dim, H_feat, W_feat)
+        B, C, Hf, Wf = features.shape
 
         # Adaptively pool to each target scale
         control_per_scale = {}
         for pn in self.patch_nums:
-            # Pool to target resolution
-            pooled = F.adaptive_avg_pool2d(features, (pn, pn))  # (B, C, pn, pn)
-            
-            # Flatten to tokens (B, pn², C)
-            tokens = pooled.flatten(2).transpose(1, 2)
-            
-            control_per_scale[pn] = tokens
+            if pn < Hf:
+                # DOWNSAMPLING: Use Area/Average pooling to prevent aliasing
+                pooled = F.adaptive_avg_pool2d(features, (pn, pn))
+            elif pn > Hf:
+                # UPSAMPLING: Use Bicubic for sharpness
+                pooled = F.interpolate(
+                    features, 
+                    size=(pn, pn), 
+                    mode='bicubic', 
+                    align_corners=False,
+                    antialias=True # Crucial for clean features
+                )
+            else:
+                # EXACT MATCH: No processing needed
+                pooled = features
+                
+            control_per_scale[pn] = pooled.flatten(2).transpose(1, 2)
 
         return control_per_scale
 
