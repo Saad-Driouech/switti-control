@@ -91,39 +91,6 @@ class SwittiPipeline:
 
         return prompt_embeds, pooled_prompt_embeds, attn_bias
 
-    def _preprocess_control_image(self, img, mid_reso):
-        # 1. Standardize Input to Tensor (B, C, H, W) in [0, 1]
-        if isinstance(img, PILImage):
-            img = torch.tensor(
-                (np.array(img.convert("RGB")) / 255.0),
-                dtype=self.model_dtype,
-                device=self.device,
-            ).permute(2, 0, 1).unsqueeze(0)
-        elif isinstance(img, torch.Tensor):
-            # Handle Tensor input
-            if img.ndim == 3:
-                img = img.unsqueeze(0)
-            if img.shape[1] == 1:
-                img = img.repeat(1, 3, 1, 1)
-            img = img.to(device=self.device, dtype=self.model_dtype)
-            
-            # Optional: Sanity check if user passed [0, 255] tensor
-            if img.max() > 1.0:
-                 img = img / 255.0
-        
-        # 2. Resize to mid-res
-        mid_reso_px = round(TRAIN_IMAGE_SIZE[0] * mid_reso)
-        img = TF.resize(img, mid_reso_px, interpolation=InterpolationMode.BICUBIC, antialias=True)
-
-        # 3. Center crop to final
-        img = TF.center_crop(img, TRAIN_IMAGE_SIZE)
-
-        # 4. Normalize to [-1, 1]
-        img = img.add(img).add_(-1)
-
-        return img
-
-
     @torch.inference_mode()
     def __call__(
         self,
@@ -139,8 +106,8 @@ class SwittiPipeline:
         turn_off_cfg_start_si: int = 10,
         turn_on_cfg_start_si: int = 0,
         last_scale_temp: None | float = None,
-        mid_reso: float = 1.125,
         control_dict: dict[str, torch.Tensor] | None = None,
+        control_end_si: int = 8,
     ) -> torch.Tensor | list[PILImage]:
         """
         only used for inference, on autoregressive mode
@@ -165,6 +132,8 @@ class SwittiPipeline:
 
         context, cond_vector, context_attn_bias = self.encode_prompt(prompt, null_prompt)
 
+        B = context.shape[0] // 2
+
         # --------------------------------------------------
         # Control Image Encoding (multi-scale)
         # --------------------------------------------------
@@ -174,33 +143,45 @@ class SwittiPipeline:
             control_contexts_per_scale = {}
 
             for ctrl_type, ctrl_input in control_dict.items():
-
                 if ctrl_input is None:
                     continue
 
-                # ---- Normalize to list ----
+                # ---- Handle list/batch of tensors ----
                 if isinstance(ctrl_input, (list, tuple)):
-                    ctrl_list = list(ctrl_input)
+                    ctrl_list = []
+                    for item in ctrl_input:
+                        if isinstance(item, torch.Tensor):
+                            # Already preprocessed
+                            if item.ndim == 3:
+                                item = item.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
+                        else:
+                            raise TypeError(f"Expected preprocessed tensor, got {type(item)}")
+                        ctrl_list.append(item)
+                    ctrl_batch = torch.cat(ctrl_list, dim=0).to(self.device, dtype=self.model_dtype)
+                
+                # ---- Handle single tensor ----
+                elif isinstance(ctrl_input, torch.Tensor):
+                    ctrl_batch = ctrl_input
+                    if ctrl_batch.ndim == 3:
+                        ctrl_batch = ctrl_batch.unsqueeze(0)
+                    ctrl_batch = ctrl_batch.to(self.device, dtype=self.model_dtype)
+                
                 else:
-                    # single PIL/tensor → list of length 1
-                    ctrl_list = [ctrl_input]
+                    raise TypeError(f"Control '{ctrl_type}' must be Tensor or list[Tensor], got {type(ctrl_input)}")
 
-                processed = []
+                # ---- Validation ----
+                if ctrl_input.ndim != 4:
+                    raise ValueError(
+                        f"Control '{ctrl_type}' must be 4D [B, C, H, W] after conversion, "
+                        f"got shape {ctrl_input.shape}"
+                    )
 
-                for item in ctrl_list:
-                    proc = self._preprocess_control_image(item, mid_reso)
-                    processed.append(proc)
-
-                # ---- Concatenate into a batch ----
-                # If *all* items are None → skip
-                if all(p is None for p in processed):
-                    continue
-
-                # Stack into batch
-                ctrl_batch = torch.cat([
-                    p if p is not None else torch.zeros_like(processed[0])
-                    for p in processed
-                ], dim=0)
+                # ---- HARD ASSERTION (critical safety check) ----
+                assert len(ctrl_input) == B, (
+                    f"Control '{ctrl_type}' batch size ({len(ctrl_input)}) "
+                    f"does not match number of prompts ({B}). "
+                    f"Got {len(ctrl_input)} control images for {B} prompts."
+                )
 
                 # Get multi-scale control features
                 ctrl_ms = self.switti.control_encoder(ctrl_batch) # ctrl_ms = {1: (B,1,D), 2: (B,4,D), ..., 32: (B,1024,D)}
@@ -210,12 +191,14 @@ class SwittiPipeline:
                     if scale not in control_contexts_per_scale:
                         control_contexts_per_scale[scale] = {}
                     
-                    # Repeat for CFG (conditional + unconditional)
-                    tokens_cfg = tokens.repeat(2, 1, 1)
+                    # ---- Build unconditional branch using learnable null ----
+                    null_tokens = self.switti.null_control_tokens[str(scale)]
+                    null_tokens = null_tokens.expand(B, -1, -1)
+                    
+                    # Stack: [conditional, unconditional]
+                    tokens_cfg = torch.cat([tokens, null_tokens], dim=0)
+                    
                     control_contexts_per_scale[scale][ctrl_type] = tokens_cfg
-
-
-        B = context.shape[0] // 2
 
         cond_vector = switti.text_pooler(cond_vector)
 
@@ -244,6 +227,8 @@ class SwittiPipeline:
         for b in switti.blocks:
             b.attn.kv_caching(switti.use_ar) # Use KV caching if switti is in the AR mode 
             b.cross_attn.kv_caching(True)
+            if b.cross_attn_control is not None:
+                b.cross_attn_control.kv_caching(switti.use_ar)
 
         for si, pn in enumerate(switti.patch_nums):  # si: i-th segment
             ratio = si / switti.num_stages_minus_1
@@ -254,9 +239,9 @@ class SwittiPipeline:
             else:
                 freqs_cis = switti.freqs_cis
 
-             # Get control tokens for THIS scale only
+            # Get control tokens for THIS scale only
             scale_control_contexts = None
-            if control_contexts_per_scale is not None and pn in control_contexts_per_scale:
+            if control_contexts_per_scale is not None and pn in control_contexts_per_scale and si < control_end_si:  # drop control after this scale
                 scale_control_contexts = control_contexts_per_scale[pn]
                 # scale_control_contexts = {ctrl_type: (2B, pn², D)} for this specific scale
 
@@ -284,6 +269,9 @@ class SwittiPipeline:
                     if b.cross_attn.caching and b.cross_attn.cached_k is not None:
                         b.cross_attn.cached_k = b.cross_attn.cached_k[:B]
                         b.cross_attn.cached_v = b.cross_attn.cached_v[:B]
+                    if b.cross_attn_control is not None and b.cross_attn_control.caching and b.cross_attn_control.cached_k is not None:
+                        b.cross_attn_control.cached_k = b.cross_attn_control.cached_k[:B]
+                        b.cross_attn_control.cached_v = b.cross_attn_control.cached_v[:B]
             else:
                 apply_smooth = more_smooth
 
@@ -342,6 +330,8 @@ class SwittiPipeline:
         for b in switti.blocks:
             b.attn.kv_caching(False)
             b.cross_attn.kv_caching(False)
+            if b.cross_attn_control is not None:
+                b.cross_attn_control.kv_caching(False)
 
         # de-normalize, from [-1, 1] to [0, 1]
         img = vae.fhat_to_img(f_hat).add(1).mul(0.5)
