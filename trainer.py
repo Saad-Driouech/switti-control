@@ -455,7 +455,7 @@ class SwittiTrainer(object):
                 loss = self.train_loss(logits_BLV.view(-1, V),
                                        gt_BL.view(-1),
                                        ).view(B, -1)
-                loss = loss.mul(self.loss_weight).sum(dim=-1).mean()
+                loss = loss.mul(self.loss_weight).sum(dim=-1).mean()  / self.grad_accum 
 
                 # --- Gate regularisation (optional) ---
                 if self.use_control_gate:
