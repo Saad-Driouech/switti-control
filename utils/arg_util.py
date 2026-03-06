@@ -134,6 +134,15 @@ class Args(Tap):
     saln: bool = False  # whether to use shared adaln
     anorm: bool = True  # whether to use L2 normalized attention
 
+    # ControlNet args
+    pretrained_switti: str = "yresearch/Switti"   # HuggingFace model ID for frozen Switti
+    control_modalities: list = None               # e.g. ["canny"] or ["canny","depth"]
+    ctrl_maps_dir: str = None                     # pre-computed control map directory
+    ctrl_strength: float = 1.0                    # inference-time control strength multiplier
+    control_ckpt: str = None                      # path to trained control weights
+    num_modalities: int = 5                       # number of spatial modalities
+    ctrl_dropout_prob: float = 0.1               # prob. of replacing modality with null ID
+
     # data
     pn: str = "1_2_3_4_5_6_8_10_13_16"
     patch_size: int = 16

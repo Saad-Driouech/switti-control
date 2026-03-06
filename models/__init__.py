@@ -4,6 +4,8 @@ from .clip import FrozenCLIPEmbedder
 from .switti import Switti
 from .vqvae import VQVAE, VQVAEHF
 from .pipeline import SwittiPipeline
+from .control_switti import SpatialEncoder, SwittiControlNet
+from .control_pipeline import SwittiControlPipeline
 
 
 def build_models(
