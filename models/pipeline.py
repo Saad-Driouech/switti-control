@@ -170,17 +170,17 @@ class SwittiPipeline:
                     raise TypeError(f"Control '{ctrl_type}' must be Tensor or list[Tensor], got {type(ctrl_input)}")
 
                 # ---- Validation ----
-                if ctrl_input.ndim != 4:
+                if ctrl_batch.ndim != 4:
                     raise ValueError(
                         f"Control '{ctrl_type}' must be 4D [B, C, H, W] after conversion, "
-                        f"got shape {ctrl_input.shape}"
+                        f"got shape {ctrl_batch.shape}"
                     )
 
                 # ---- HARD ASSERTION (critical safety check) ----
-                assert len(ctrl_input) == B, (
-                    f"Control '{ctrl_type}' batch size ({len(ctrl_input)}) "
+                assert len(ctrl_batch) == B, (
+                    f"Control '{ctrl_type}' batch size ({len(ctrl_batch)}) "
                     f"does not match number of prompts ({B}). "
-                    f"Got {len(ctrl_input)} control images for {B} prompts."
+                    f"Got {len(ctrl_batch)} control images for {B} prompts."
                 )
 
                 # Get multi-scale control features
