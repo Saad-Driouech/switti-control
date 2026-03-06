@@ -149,7 +149,7 @@ class Switti(nn.Module):
             for pn in self.patch_nums:
                 L = pn * pn
                 self.null_control_tokens[str(pn)] = nn.Parameter(
-                    torch.randn(1, L, self.control_context_dim) * 0.02
+                    torch.randn(1, L, self.control_context_dim) * 0.2
                 )
         else:
             self.null_control_tokens = None
@@ -330,11 +330,15 @@ class Switti(nn.Module):
                 
                 # --- TRAINING: Concatenate all scales ---
                 if self.training:
-                    if torch.rand(1).item() < 0.1:
-                        ctrl_ms = {
-                            pn: self.null_control_tokens[str(pn)].expand(B, -1, -1)
-                            for pn in self.patch_nums
-                        }
+                    drop_mask = torch.rand(B) < 0.1  # (B,) per-sample dropout
+                    ctrl_ms = {
+                        pn: torch.where(
+                            drop_mask[:, None, None].to(tokens.device),
+                            self.null_control_tokens[str(pn)].expand(B, -1, -1),
+                            tokens,
+                        )
+                        for pn, tokens in ctrl_ms.items()
+                    }
 
                     ctrl_tokens_list = []
                     
