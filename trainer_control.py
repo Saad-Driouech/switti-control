@@ -137,6 +137,9 @@ class SwittiControlTrainer:
                 prompt_attn_bias,
             ) = self.pipe.encode_prompt(captions, encode_null=False)
 
+            # All training images are resized to data_load_reso; supply fixed crop condition
+            batch_hw = B * [self.resos[-1]]
+
             with self.optimizer.amp_ctx:
                 logits_BLV = self.control_net(
                     x_BLCv_wo_first_l,
@@ -145,8 +148,8 @@ class SwittiControlTrainer:
                     prompt_attn_bias=prompt_attn_bias,
                     ctrl_image=ctrl_images,
                     modality_ids=modality_ids,
-                    batch_height=getattr(self.args, "batch_height", None),
-                    batch_width=getattr(self.args, "batch_width", None),
+                    batch_height=batch_hw,
+                    batch_width=batch_hw,
                 )
                 loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
                 loss = loss.mul(self.loss_weight).sum(dim=-1).mean()

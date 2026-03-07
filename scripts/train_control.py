@@ -84,7 +84,8 @@ def build_everything(args: arg_util.Args):
     dist.barrier()
 
     vae_local = VQVAEHF.from_pretrained(
-        getattr(args, "vae_ckpt", "yresearch/VQVAE-Switti")
+        getattr(args, "vae_ckpt", "yresearch/VQVAE-Switti"),
+        reso=args.data_load_reso,
     ).to(device)
 
     num_modalities = getattr(args, "num_modalities", 5)

@@ -113,7 +113,8 @@ class SwittiControlNet(nn.Module):
 
         C = frozen_switti.C
         self.spatial_encoder = SpatialEncoder(num_modalities=num_modalities, out_dim=C)
-        self.control_blocks = copy.deepcopy(frozen_switti.blocks)  # trainable
+        self.control_blocks = copy.deepcopy(frozen_switti.blocks)
+        self.control_blocks.requires_grad_(True)  # deepcopy preserves False from frozen_switti
         self.zero_convs = nn.ModuleList(
             [self._make_zero_conv(C) for _ in range(len(frozen_switti.blocks))]
         )
