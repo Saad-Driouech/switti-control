@@ -92,6 +92,7 @@ def build_everything(args: arg_util.Args):
     control_net_wo_ddp = SwittiControlNet(
         frozen_switti=frozen_switti,
         num_modalities=num_modalities,
+        use_gradient_checkpointing=getattr(args, "use_gradient_checkpointing", False),
     ).to(device)
 
     # Optionally resume from checkpoint

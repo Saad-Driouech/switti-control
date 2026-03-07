@@ -106,10 +106,11 @@ class SwittiControlNet(nn.Module):
     is identical to uncontrolled Switti.
     """
 
-    def __init__(self, frozen_switti: Switti, num_modalities: int = 5):
+    def __init__(self, frozen_switti: Switti, num_modalities: int = 5, use_gradient_checkpointing: bool = False):
         super().__init__()
         frozen_switti.requires_grad_(False)
         self.frozen_switti = frozen_switti
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         C = frozen_switti.C
         self.spatial_encoder = SpatialEncoder(num_modalities=num_modalities, out_dim=C)
@@ -258,15 +259,28 @@ class SwittiControlNet(nn.Module):
             switti.blocks, self.control_blocks, self.zero_convs
         ):
             # Control branch
-            x_ctrl = ctrl_blk(
-                x=x_ctrl,
-                cond_BD=cond_BD,
-                attn_bias=attn_bias,
-                context=prompt_embeds,
-                context_attn_bias=prompt_attn_bias,
-                freqs_cis=freqs_cis,
-                crop_cond=crop_cond,
-            )
+            if self.use_gradient_checkpointing and self.training:
+                x_ctrl = torch.utils.checkpoint.checkpoint(
+                    ctrl_blk,
+                    use_reentrant=False,
+                    x=x_ctrl,
+                    cond_BD=cond_BD,
+                    attn_bias=attn_bias,
+                    context=prompt_embeds,
+                    context_attn_bias=prompt_attn_bias,
+                    freqs_cis=freqs_cis,
+                    crop_cond=crop_cond,
+                )
+            else:
+                x_ctrl = ctrl_blk(
+                    x=x_ctrl,
+                    cond_BD=cond_BD,
+                    attn_bias=attn_bias,
+                    context=prompt_embeds,
+                    context_attn_bias=prompt_attn_bias,
+                    freqs_cis=freqs_cis,
+                    crop_cond=crop_cond,
+                )
             ctrl_signal = zero_conv(x_ctrl)
 
             # Frozen branch with injection
