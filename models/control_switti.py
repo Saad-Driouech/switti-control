@@ -284,18 +284,34 @@ class SwittiControlNet(nn.Module):
             ctrl_signal = zero_conv(x_ctrl)
 
             # Frozen branch with injection
-            x_frozen = self._frozen_block_forward(
-                frz_blk=frz_blk,
-                x=x_frozen,
-                ctrl_signal=ctrl_signal,
-                cond_BD=cond_BD,
-                attn_bias=attn_bias,
-                prompt_embeds=prompt_embeds,
-                prompt_attn_bias=prompt_attn_bias,
-                freqs_cis=freqs_cis,
-                crop_cond=crop_cond,
-                ctrl_strength=ctrl_strength,
-            )
+            if self.use_gradient_checkpointing and self.training:
+                x_frozen = torch.utils.checkpoint.checkpoint(
+                    self._frozen_block_forward,
+                    use_reentrant=False,
+                    frz_blk=frz_blk,
+                    x=x_frozen,
+                    ctrl_signal=ctrl_signal,
+                    cond_BD=cond_BD,
+                    attn_bias=attn_bias,
+                    prompt_embeds=prompt_embeds,
+                    prompt_attn_bias=prompt_attn_bias,
+                    freqs_cis=freqs_cis,
+                    crop_cond=crop_cond,
+                    ctrl_strength=ctrl_strength,
+                )
+            else:
+                x_frozen = self._frozen_block_forward(
+                    frz_blk=frz_blk,
+                    x=x_frozen,
+                    ctrl_signal=ctrl_signal,
+                    cond_BD=cond_BD,
+                    attn_bias=attn_bias,
+                    prompt_embeds=prompt_embeds,
+                    prompt_attn_bias=prompt_attn_bias,
+                    freqs_cis=freqs_cis,
+                    crop_cond=crop_cond,
+                    ctrl_strength=ctrl_strength,
+                )
 
         # ------------------------------------------------------------------
         # Step 4: Logits
