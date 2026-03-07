@@ -126,8 +126,12 @@ def build_everything(args: arg_util.Args):
         # Wrap each AdaLNSelfCrossAttn block individually for memory efficiency
         return recurse or isinstance(module, AdaLNSelfCrossAttn)
 
+    # frozen_switti must NOT be sharded by FSDP: _frozen_block_forward accesses
+    # its sub-layers directly (outside FSDP's managed forward), so parameters
+    # must be full tensors on every rank, not flat 1-D shards.
     control_net: FSDP = (FSDP if dist.initialized() else NullDDP)(
         control_net_wo_ddp,
+        ignored_modules=[control_net_wo_ddp.frozen_switti],
         auto_wrap_policy=_wrap_policy,
         device_id=dist.get_local_rank(),
         sharding_strategy=(
