@@ -257,7 +257,7 @@ def build_everything(args: arg_util.Args):
         dist.barrier()
         vae_local.load_state_dict(torch.load(args.vae_ckpt, map_location="cpu"), strict=True)
     else:
-        vae_local = VQVAEHF.from_pretrained(args.vae_ckpt).to(dist.get_device())
+        vae_local = VQVAEHF.from_pretrained(args.vae_ckpt, reso=args.data_load_reso).to(dist.get_device())
         pipe.vae = vae_local
 
     start_it = load_model_state(args, switti_wo_ddp)
