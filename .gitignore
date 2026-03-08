@@ -19,3 +19,7 @@ local_output*
 *.log
 *.txt
 *.ipynb
+logs/
+*.sh
+*.png
+*.out
