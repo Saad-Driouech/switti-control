@@ -170,6 +170,8 @@ class SwittiControlTrainer:
                     prompt_attn_bias=prompt_attn_bias,
                     ctrl_image=ctrl_images,
                     modality_ids=modality_ids,
+                    batch_height=batch_hw,
+                    batch_width=batch_hw,
                 )
 
             pred_BL = logits_BLV.data.argmax(dim=-1)
