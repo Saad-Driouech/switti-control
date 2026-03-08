@@ -14,6 +14,7 @@ import random
 from collections import defaultdict
 from typing import List, Optional, Tuple, Union
 
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -188,6 +189,15 @@ class SwittiControlTrainer:
             self.log_ctrl_dict = None
 
         print(f"[Trainer] Log prompts: {self.log_prompts}")
+
+        # MJHQ prompts for T2I quality monitoring (no control)
+        try:
+            df = pd.read_csv("eval_prompts/mjhq.csv")
+            self.mjhq_prompts = df["captions"].astype(str).tolist()[:12]
+        except Exception as e:
+            print(f"[Warning] Could not load MJHQ prompts ({e}); using EVAL_PROMPTS fallback.")
+            self.mjhq_prompts = EVAL_PROMPTS[:12]
+        print(f"[Trainer] MJHQ prompts: {self.mjhq_prompts}")
 
     # ------------------------------------------------------------------
     # Visualisation helpers (mirrored from SwittiTrainer)
@@ -399,7 +409,7 @@ class SwittiControlTrainer:
                     if dist.is_master():
                         self._log_ctrl_and_generated(
                             tb_lg,
-                            tag_prefix=f"train_cfg={self.args.guidance}",
+                            tag_prefix=f"train_coco_i2i_cfg={self.args.guidance}",
                             gen_imgs=imgs_grid,
                             ctrl_tensor=train_ctrl,
                             modality=batch_modality,
@@ -429,13 +439,37 @@ class SwittiControlTrainer:
                         if dist.is_master():
                             self._log_ctrl_and_generated(
                                 tb_lg,
-                                tag_prefix=f"eval_cfg={self.args.guidance}",
+                                tag_prefix=f"eval_coco_i2i_cfg={self.args.guidance}",
                                 gen_imgs=imgs_grid,
                                 ctrl_tensor=log_ctrl,
                                 modality=self.log_modality,
                                 g_it=g_it,
                             )
                         del imgs, imgs_grid
+
+                    # --- MJHQ T2I: no control (ctrl_strength=0) ---
+                    n_mjhq = len(self.mjhq_prompts)
+                    dummy_ctrl = torch.zeros(
+                        n_mjhq, 3, self.resos[-1], self.resos[-1], dtype=torch.float32
+                    )
+                    imgs = self.pipe(
+                        prompt=self.mjhq_prompts,
+                        ctrl_image=dummy_ctrl,
+                        modality=self.log_modality,
+                        ctrl_strength=0.0,  # disable control → pure T2I
+                        cfg=self.args.guidance,
+                        top_k=self.args.top_k,
+                        top_p=self.args.top_p,
+                        return_pil=False,
+                    )
+                    imgs_grid = make_grid(imgs, nrow=math.floor(math.sqrt(n_mjhq)))
+                    if dist.is_master():
+                        tb_lg.log_image(
+                            f"eval_mjhq_t2i_cfg={self.args.guidance}",
+                            imgs_grid.detach().cpu().float().clamp(0, 1),
+                            step=g_it,
+                        )
+                    del imgs, imgs_grid, dummy_ctrl
 
             if dist.is_master():
                 tb_lg.update(head="Control_iter_loss", **kw, step=g_it)
