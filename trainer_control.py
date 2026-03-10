@@ -58,6 +58,7 @@ def generate_logging_prompts_captions(
     control_modalities: Optional[List[str]],
     num_select: int = 12,
     final_reso: int = 512,
+    val_subset_name: str = "val2014",
 ) -> Tuple[List[str], Optional[dict]]:
     """
     Select eval samples for TensorBoard logging.
@@ -110,7 +111,7 @@ def generate_logging_prompts_captions(
         for modality in control_modalities:
             tensors = []
             for fname in selected_filenames:
-                ctrl_fp = os.path.join(ctrl_maps_dir, modality, fname)
+                ctrl_fp = os.path.join(ctrl_maps_dir, modality, val_subset_name, fname)
                 if os.path.exists(ctrl_fp):
                     try:
                         img = Image.open(ctrl_fp).convert("RGB")
