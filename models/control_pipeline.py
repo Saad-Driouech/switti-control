@@ -126,7 +126,7 @@ class SwittiControlPipeline(SwittiPipeline):
     def __call__(
         self,
         prompt,
-        ctrl_image,
+        ctrl_image=None,
         modality: str = "canny",
         ctrl_strength: float = 1.0,
         null_prompt: str = "",
@@ -161,6 +161,11 @@ class SwittiControlPipeline(SwittiPipeline):
 
         context, cond_vector, context_attn_bias = self.encode_prompt(prompt, null_prompt)
         B = context.shape[0] // 2
+
+        # ctrl_image=None → T2I mode: zero control signal
+        if ctrl_image is None:
+            ctrl_image = torch.zeros(B, 3, TRAIN_IMAGE_SIZE[0], TRAIN_IMAGE_SIZE[1])
+            ctrl_strength = 0.0
 
         cond_vector = switti.text_pooler(cond_vector)
 

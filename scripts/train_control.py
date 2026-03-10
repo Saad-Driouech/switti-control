@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from calculate_metrics import distributed_metrics_with_csv, to_PIL_image
+from utils.fid_score_in_memory import calculate_fid
 from torch.distributed.fsdp import ShardingStrategy
 from torch.utils.data import DataLoader
 
@@ -252,6 +254,55 @@ def main_training():
 
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
             save_model_state(cur_iter, args, trainer.control_net)
+
+            # Calculate metrics (same as train.py; ctrl_image=None → T2I mode)
+            trainer.pipe.control_net.eval()
+            for eval_set_name in ["coco", "mjhq"]:
+                eval_prompts_path = f"eval_prompts/{eval_set_name}.csv"
+                fid_stats_path = (
+                    args.coco_ref_stats_path
+                    if eval_set_name == "coco"
+                    else args.mjhq_ref_stats_path
+                )
+
+                with FSDP.summon_full_params(trainer.control_net, writeback=False):
+                    local_images, local_pick_score, local_clip_score, local_image_reward = (
+                        distributed_metrics_with_csv(trainer.pipe, eval_prompts_path, args)
+                    )
+
+                dist.allreduce(local_pick_score)
+                pick_score = local_pick_score.item() / dist.get_world_size()
+
+                dist.allreduce(local_clip_score)
+                clip_score = local_clip_score.item() / dist.get_world_size()
+
+                dist.allreduce(local_image_reward)
+                image_reward = local_image_reward.item() / dist.get_world_size()
+
+                gathered_images = dist.allgather(local_images)
+                images = [to_PIL_image(image) for image in gathered_images]
+
+                if dist.is_master():
+                    print("Evaluating FID score...")
+                    fid_score = calculate_fid(
+                        images, fid_stats_path, inception_path=args.inception_path
+                    )
+                    tb_lg.update(
+                        head=f"{eval_set_name}_t2i_metrics_top_k={args.top_k}_top_p={args.top_p}_cfg={args.guidance}",
+                        CLIP=clip_score,
+                        FID=fid_score,
+                        Pickscore=pick_score,
+                        ImageReward=image_reward,
+                        step=cur_iter,
+                    )
+
+                del local_images, images, gathered_images
+                gc.collect()
+                torch.cuda.empty_cache()
+                dist.barrier()
+                print(f"Finished {eval_set_name} metrics at iter {cur_iter}.")
+
+            trainer.pipe.control_net.train()
             args.dump_log()
             tb_lg.flush()
 
