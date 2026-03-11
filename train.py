@@ -223,7 +223,7 @@ def main_training():
                     fid_stats_path = args.mjhq_ref_stats_path
 
                 with FSDP.summon_full_params(trainer.switti, writeback=False):
-                    local_images, local_pick_score, local_clip_score, local_image_reward = distributed_metrics_with_csv(
+                    local_images, local_pick_score, local_clip_score, local_image_reward, _ = distributed_metrics_with_csv(
                         trainer.pipe,
                         eval_prompts_path,
                         args,

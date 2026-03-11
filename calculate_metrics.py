@@ -4,11 +4,14 @@ import ImageReward
 import numpy as np
 import pandas as pd
 import torch
+from torchvision import transforms
 from transformers import AutoModel, AutoProcessor
 
 from PIL import Image
 from tqdm.auto import tqdm
 import dist
+
+from utils.control_metrics import calculate_control_metrics
 
 
 @torch.no_grad()
@@ -144,41 +147,119 @@ def distributed_metrics_with_csv(
     pipe,
     csv_path,
     args,
+    control_path: str = None,
+    val_subset: str = "val2014",
+    control_modality: str = None,
 ):
+    """
+    Args:
+        control_path:     root of ctrl map dirs (e.g. $LOCAL_DATA/ctrl_maps).
+                          When set, generates in control mode using
+                          <control_path>/<control_modality>/<val_subset>/<filename>.
+        val_subset:       subdirectory for val images (default 'val2014').
+        control_modality: modality string, e.g. 'canny' (required when control_path set).
+    Returns:
+        (local_images, local_pick_score, local_clip_score,
+         local_image_reward, local_control_metric_tensors)
+    """
     pipe.switti.eval()
     max_count = args.metrics_max_count
-    rank_batches, *_ = prepare_prompts(csv_path, args.eval_batch_size, max_count)
+    rank_caption_batches, rank_filename_batches = prepare_prompts(csv_path, args.eval_batch_size, max_count)
     assert max_count % (args.eval_batch_size * dist.get_world_size()) == 0
+
+    ctrl_transform = transforms.Compose([
+        transforms.Resize((args.data_load_reso, args.data_load_reso)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ]) if control_path is not None else None
+
     local_images, local_prompts = [], []
-    for batch in tqdm(rank_batches, unit="batch", disable=(dist.get_rank() != 0)):
-        texts = [str(prompt) for prompt in batch
+    all_ctrl_tensors = []
+
+    for captions_batch, filenames_batch in tqdm(
+        zip(rank_caption_batches, rank_filename_batches),
+        unit="batch",
+        disable=(dist.get_rank() != 0),
+    ):
+        texts = [str(caption) for caption in captions_batch
                  for _ in range(args.num_images_for_metrics)]
-        image_tensors = pipe(
-            prompt=texts,
-            seed=args.seed,
-            cfg=args.guidance,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            more_smooth=False,
-            return_pil=False,
-        )
+
+        ctrl_tensor_batch = None
+        if control_path is not None and control_modality is not None:
+            raw_ctrl = []
+            for fname in filenames_batch:
+                fname = str(fname)
+                fname_png = fname.replace(".jpg", ".png")
+                if fname in ("None", "nan", ""):
+                    t = torch.zeros(3, args.data_load_reso, args.data_load_reso)
+                else:
+                    ctrl_fp = os.path.join(control_path, control_modality, val_subset, fname_png)
+                    if os.path.exists(ctrl_fp):
+                        try:
+                            t = ctrl_transform(Image.open(ctrl_fp).convert("RGB"))
+                        except Exception as e:
+                            print(f"[Warning] {ctrl_fp}: {e}")
+                            t = torch.zeros(3, args.data_load_reso, args.data_load_reso)
+                    else:
+                        t = torch.zeros(3, args.data_load_reso, args.data_load_reso)
+                for _ in range(args.num_images_for_metrics):
+                    raw_ctrl.append(t)
+            ctrl_tensor_batch = torch.stack(raw_ctrl, dim=0)
+            all_ctrl_tensors.extend(raw_ctrl)
+
+        if ctrl_tensor_batch is not None:
+            image_tensors = pipe(
+                prompt=texts,
+                ctrl_image=ctrl_tensor_batch,
+                modality=control_modality,
+                seed=args.seed,
+                cfg=args.guidance,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                more_smooth=False,
+                return_pil=False,
+            )
+        else:
+            image_tensors = pipe(
+                prompt=texts,
+                seed=args.seed,
+                cfg=args.guidance,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                more_smooth=False,
+                return_pil=False,
+            )
 
         local_images.extend(image_tensors)
         local_prompts.extend(texts)
 
     local_images = torch.stack(local_images).cuda()
+    pil_images = [to_PIL_image(image) for image in local_images.clone()]
 
     local_pick_score, local_clip_score, local_image_reward = calculate_scores(
-        [to_PIL_image(image) for image in local_images.clone()],
+        pil_images,
         local_prompts,
         device=dist.get_device(),
         clip_model_name_or_path=args.clip_model_name_or_path,
         pickscore_model_name_or_path=args.pickscore_model_name_or_path,
         image_reward_path=args.image_reward_path,
     )
-    # Done.
+
+    # Control-specific metrics
+    local_control_metric_tensors = {}
+    if control_path is not None and control_modality is not None and all_ctrl_tensors:
+        ctrl_metrics = calculate_control_metrics(
+            pil_images,
+            all_ctrl_tensors,
+            control_modality,
+            device=dist.get_device(),
+        )
+        local_control_metric_tensors = {
+            k: torch.tensor(v).cuda() for k, v in ctrl_metrics.items()
+        }
+
     dist.barrier()
-    return local_images, local_pick_score, local_clip_score, local_image_reward
+    return local_images, local_pick_score, local_clip_score, local_image_reward, local_control_metric_tensors
 
 
 def save_images(images, prompts, save_path):
@@ -192,21 +273,21 @@ def save_images(images, prompts, save_path):
 def prepare_prompts(prompts_path, batch_size=1, max_count=None):
     assert max_count % dist.get_world_size() == 0
     df = pd.read_csv(prompts_path)
-    all_text = list(df["captions"])
+    captions = df["captions"].astype(str).tolist()
+    filenames = df["file_name"].astype(str).tolist() if "file_name" in df.columns else [None] * len(df)
 
     if max_count is not None:
-        all_text = all_text[:max_count]
+        captions = captions[:max_count]
+        filenames = filenames[:max_count]
 
     num_batches = (
-        (len(all_text) - 1) // (batch_size * dist.get_world_size()) + 1
+        (len(captions) - 1) // (batch_size * dist.get_world_size()) + 1
     ) * dist.get_world_size()
-    all_batches = np.array_split(np.array(all_text), num_batches)
-    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
-
-    index_list = np.arange(len(all_text))
-    all_batches_index = np.array_split(index_list, num_batches)
-    rank_batches_index = all_batches_index[dist.get_rank() :: dist.get_world_size()]
-    return rank_batches, rank_batches_index, all_text
+    caption_batches = np.array_split(np.array(captions), num_batches)
+    filename_batches = np.array_split(np.array(filenames), num_batches)
+    rank_caption_batches = caption_batches[dist.get_rank() :: dist.get_world_size()]
+    rank_filename_batches = filename_batches[dist.get_rank() :: dist.get_world_size()]
+    return rank_caption_batches, rank_filename_batches
 
 
 def to_PIL_image(image_tensor):

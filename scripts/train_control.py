@@ -255,8 +255,9 @@ def main_training():
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
             save_model_state(cur_iter, args, trainer.control_net)
 
-            # Calculate metrics (same as train.py; ctrl_image=None → T2I mode)
+            # Calculate metrics
             trainer.pipe.control_net.eval()
+            control_modality = getattr(args, "control_modalities", ["canny"])[0]
             for eval_set_name in ["coco", "mjhq"]:
                 eval_prompts_path = f"eval_prompts/{eval_set_name}.csv"
                 fid_stats_path = (
@@ -264,10 +265,24 @@ def main_training():
                     if eval_set_name == "coco"
                     else args.mjhq_ref_stats_path
                 )
+                # COCO: i2i evaluation with control images
+                # MJHQ: T2I evaluation (control_path=None → ctrl_strength=0)
+                eval_control_path = (
+                    getattr(args, "ctrl_maps_dir", None)
+                    if eval_set_name == "coco"
+                    else None
+                )
 
                 with FSDP.summon_full_params(trainer.control_net, writeback=False):
-                    local_images, local_pick_score, local_clip_score, local_image_reward = (
-                        distributed_metrics_with_csv(trainer.pipe, eval_prompts_path, args)
+                    local_images, local_pick_score, local_clip_score, local_image_reward, local_ctrl_metrics = (
+                        distributed_metrics_with_csv(
+                            trainer.pipe,
+                            eval_prompts_path,
+                            args,
+                            control_path=eval_control_path,
+                            val_subset="val2014",
+                            control_modality=control_modality if eval_control_path else None,
+                        )
                     )
 
                 dist.allreduce(local_pick_score)
@@ -287,14 +302,22 @@ def main_training():
                     fid_score = calculate_fid(
                         images, fid_stats_path, inception_path=args.inception_path
                     )
+                    tag = f"{eval_set_name}_metrics_top_k={args.top_k}_top_p={args.top_p}_cfg={args.guidance}"
                     tb_lg.update(
-                        head=f"{eval_set_name}_t2i_metrics_top_k={args.top_k}_top_p={args.top_p}_cfg={args.guidance}",
+                        head=tag,
                         CLIP=clip_score,
                         FID=fid_score,
                         Pickscore=pick_score,
                         ImageReward=image_reward,
                         step=cur_iter,
                     )
+                    # Log control-specific metrics (only for COCO i2i)
+                    for metric_name, metric_tensor in local_ctrl_metrics.items():
+                        tb_lg.update(
+                            head=f"{eval_set_name}_control_metrics",
+                            **{metric_name: metric_tensor.item()},
+                            step=cur_iter,
+                        )
 
                 del local_images, images, gathered_images
                 gc.collect()
