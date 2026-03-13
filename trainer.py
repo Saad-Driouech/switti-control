@@ -614,10 +614,17 @@ class SwittiTrainer(object):
                             control_dict=None,
                             g_it=g_it,
                         )
-                        # Log prompts
+                        # Log MJHQ prompts
                         prompt_text = "\n".join([f"{i}: {p}" for i, p in enumerate(self.mjhq_prompts)])
                         tb_lg.log_text(
                             f"mjhq_t2i_prompts_cfg={cfg}",
+                            prompt_text,
+                            step=g_it
+                        )
+                        # Log COCO eval prompts
+                        prompt_text = "\n".join([f"{i}: {p}" for i, p in enumerate(self.log_prompts)])
+                        tb_lg.log_text(
+                            f"coco_eval_prompts_cfg={cfg}",
                             prompt_text,
                             step=g_it
                         )
