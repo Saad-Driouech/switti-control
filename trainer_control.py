@@ -446,6 +446,10 @@ class SwittiControlTrainer:
                                 modality=self.log_modality,
                                 g_it=g_it,
                             )
+                            coco_prompt_text = "\n\n".join(
+                                f"{i+1}. {p}" for i, p in enumerate(self.log_prompts)
+                            )
+                            tb_lg.log_text("coco_eval_prompts", coco_prompt_text, step=g_it)
                         del imgs, imgs_grid
 
                     # --- MJHQ T2I: no control (ctrl_strength=0) ---
@@ -470,6 +474,10 @@ class SwittiControlTrainer:
                             imgs_grid.detach().cpu().float().clamp(0, 1),
                             step=g_it,
                         )
+                        mjhq_prompt_text = "\n\n".join(
+                            f"{i+1}. {p}" for i, p in enumerate(self.mjhq_prompts)
+                        )
+                        tb_lg.log_text("mjhq_eval_prompts", mjhq_prompt_text, step=g_it)
                     del imgs, imgs_grid, dummy_ctrl
 
             if dist.is_master():
