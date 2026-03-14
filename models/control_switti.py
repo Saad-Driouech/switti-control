@@ -56,6 +56,8 @@ class SpatialEncoder(nn.Module):
         # ID = num_modalities is the null/dropout modality
         self.modality_embed = nn.Embedding(num_modalities + 1, 128)
         self.proj = nn.Linear(128, out_dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
 
     def extract_features(self, ctrl_image: torch.Tensor) -> torch.Tensor:
         """Run backbone once → (B, 128, H/4, W/4)."""
