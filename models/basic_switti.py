@@ -512,25 +512,13 @@ class AdaLNSelfCrossAttn(nn.Module):
             )
         ).mul(gamma1)
 
-        # Cross-attention to primary context (text)
-        if context is not None and self.cross_attn is not None:
-            normed_context = self.attention_y_norm(context) if self.attention_y_norm is not None else context
-            x = x + self.cross_attention_norm2(
-                self.cross_attn(
-                    self.cross_attention_norm1(x),
-                    normed_context,
-                    context_attn_bias=context_attn_bias,
-                    freqs_cis=freqs_cis,
-                )
-            )
-
-        # --- Image control fusion (two modes) ---
+        # --- Image control fusion (two modes) — before text cross-attention ---
         if control_contexts is not None:
             for ctrl_type, control_context in control_contexts.items():
                 # Ensure length matches (safety check)
                 assert control_context.shape[1] == x.shape[1], \
                     f"Control length {control_context.shape[1]} != x length {x.shape[1]}"
-                
+
                 normed_ctrl = (
                     self.attention_control_norm(control_context)
                     if self.attention_control_norm is not None
@@ -558,6 +546,18 @@ class AdaLNSelfCrossAttn(nn.Module):
                 else:
                     # fallback silently ignore if fusion requested but no module available
                     pass
+
+        # Cross-attention to primary context (text)
+        if context is not None and self.cross_attn is not None:
+            normed_context = self.attention_y_norm(context) if self.attention_y_norm is not None else context
+            x = x + self.cross_attention_norm2(
+                self.cross_attn(
+                    self.cross_attention_norm1(x),
+                    normed_context,
+                    context_attn_bias=context_attn_bias,
+                    freqs_cis=freqs_cis,
+                )
+            )
 
         x = x + self.ffn_norm2(
             self.ffn(self.ffn_norm1(x).mul(scale2.add(1)).add(shift2))
