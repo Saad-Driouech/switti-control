@@ -183,8 +183,10 @@ class ViTControlEncoder(nn.Module):
                 features_only=False,
             )
             backbone_dim = self.backbone.embed_dim
-            self.expected_size = self.backbone.patch_embed.img_size[0]
-            self.patch_size = self.backbone.patch_embed.patch_size[0]
+            img_size = self.backbone.patch_embed.img_size
+            self.expected_size = img_size if isinstance(img_size, int) else img_size[0]
+            patch_size = self.backbone.patch_embed.patch_size
+            self.patch_size = patch_size if isinstance(patch_size, int) else patch_size[0]
 
             # Add ImageNet normalization constants
             config = self.backbone.default_cfg
@@ -219,11 +221,11 @@ class ViTControlEncoder(nn.Module):
                     align_corners=False,
                 )
 
-            feats = self.backbone.forward_features(x) # (B, 1+L, D_backbone)
+            feats = self.backbone.forward_features(x)  # (B, num_prefix+L, D_backbone)
 
-            # remove CLS if present
-            if feats.shape[1] > 1 and hasattr(self.backbone, "global_pool"):
-                feats = feats[:, 1:] # (B, L, D_backbone)
+            # Remove prefix tokens: CLS + register tokens (DINOv2 reg models have >1)
+            num_prefix = getattr(self.backbone, 'num_prefix_tokens', 1)
+            feats = feats[:, num_prefix:]  # (B, L, D_backbone)
 
         else:
             feats = self.backbone(x) # (B, L, D_backbone)
