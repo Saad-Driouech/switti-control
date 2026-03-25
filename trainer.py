@@ -537,7 +537,7 @@ class SwittiTrainer(object):
                 kw[f"L_total"] += ce / len(self.begin_ends)
 
             if g_it % self.args.log_images_iters == 0:
-                with FSDP.summon_full_params(self.switti, writeback=False):
+                with FSDP.summon_full_params(self.switti, writeback=False), torch.no_grad(), self.optimizer.amp_ctx:
                     torch.cuda.empty_cache()
                     for cfg in [6]: # SAAD: add o
                         subprompt = prompt[:16]
