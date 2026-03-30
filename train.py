@@ -141,6 +141,7 @@ def build_everything(args: arg_util.Args):
     print(f"global bs={args.glb_batch_size}, local bs={args.batch_size}")
     dataset_train = build_dataset(
         args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+        control_types=args.control_types,
     )
     ld_train = DataLoader(
         dataset=dataset_train, num_workers=args.workers, pin_memory=True,

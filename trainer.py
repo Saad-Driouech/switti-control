@@ -102,7 +102,15 @@ class SwittiTrainer(object):
         # forward
         self.switti.train()
         for accum_iter in range(self.grad_accum):
-            image, prompt = next(self.dataloader)
+            batch = next(self.dataloader)
+            if len(batch) == 2:
+                image, prompt = batch
+                control_dict = None
+            elif len(batch) == 3:
+                image, prompt, orig_size = batch
+                control_dict = None
+            else:
+                image, prompt, control_dict, orig_size = batch
 
             inp_B3HW = image.to(self.device, non_blocking=True)
             inp_B3HW = F.interpolate(

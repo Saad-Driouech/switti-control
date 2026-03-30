@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -29,6 +29,15 @@ except ImportError as e:
     raise e
 
 import dist
+
+def parse_control_types(value: str) -> Union[List[str], None]:
+    """Parse control_types argument which can be a string or comma-separated list."""
+    if value is None or value.lower() == 'none':
+        return None
+    if ',' in value:
+        return [s.strip() for s in value.split(',')]
+    return [value.strip()]
+
 
 RESOLUTION_PATCH_NUMS_MAPPING = {
     256: "1_2_3_4_5_6_8_10_13_16",
@@ -134,6 +143,9 @@ class Args(Tap):
     saln: bool = False  # whether to use shared adaln
     anorm: bool = True  # whether to use L2 normalized attention
 
+    # Control data args (shared with spatial-control branch)
+    control_types: Union[str, List[str], None] = None  # e.g. "canny" or "canny,depth" — control modalities to load from disk
+
     # ControlNet args
     pretrained_switti: str = "yresearch/Switti"   # HuggingFace model ID for frozen Switti
     control_modalities: list = None               # e.g. ["canny"] or ["canny","depth"]
@@ -218,6 +230,10 @@ class Args(Tap):
     tf32: bool = True  # whether to use TensorFloat32
     device: str = "cpu"  # [automatically set; don't specify this]
     seed: int = None  # seed
+
+    def configure(self) -> None:
+        """Configure argument parsing for Union types."""
+        self.add_argument('--control_types', type=parse_control_types)
 
     def seed_everything(self, benchmark: bool):
         torch.backends.cudnn.enabled = True
@@ -389,5 +405,11 @@ def init_dist_and_get_args():
 
     tb_name = "tb_logs"
     args.tb_log_dir_path = os.path.join(args.local_out_dir_path, tb_name)
+
+    # parse control_types
+    if not hasattr(args, "control_types"):
+        args.control_types = None
+    if args.control_types is not None and isinstance(args.control_types, str):
+        args.control_types = parse_control_types(args.control_types)
 
     return args
