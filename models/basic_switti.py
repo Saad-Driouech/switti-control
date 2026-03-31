@@ -530,7 +530,7 @@ class AdaLNSelfCrossAttn(nn.Module):
                     control_out = self.cross_attn_control(
                         self.cross_attention_control_norm1(x),
                         normed_ctrl,
-                        context_attn_bias=attn_bias,
+                        context_attn_bias=None,
                         freqs_cis=freqs_cis,
                     )
                     # Apply learned gate (sigmoid to keep in [0,1])
