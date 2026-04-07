@@ -16,7 +16,7 @@ from models.switti import Switti, get_crop_condition
 
 __all__ = ["SpatialEncoder", "SwittiControlNet"]
 
-MODALITY_IDS = {"canny": 0, "depth": 1, "seg": 2, "normal": 3, "hed": 4}
+MODALITY_IDS = {"canny": 0, "depth": 1, "seg": 2, "normal": 3, "hed": 4, "gray": 5}
 
 
 def _gn(num_channels: int) -> nn.GroupNorm:
@@ -35,7 +35,7 @@ class SpatialEncoder(nn.Module):
         per scale: adaptive_avg_pool2d(feat, (pn, pn)) → add modality_embed → proj to C
     """
 
-    def __init__(self, num_modalities: int = 5, out_dim: int = 1024):
+    def __init__(self, num_modalities: int = 6, out_dim: int = 1024):
         super().__init__()
         self.out_dim = out_dim
 
@@ -108,7 +108,7 @@ class SwittiControlNet(nn.Module):
     is identical to uncontrolled Switti.
     """
 
-    def __init__(self, frozen_switti: Switti, num_modalities: int = 5, use_gradient_checkpointing: bool = False):
+    def __init__(self, frozen_switti: Switti, num_modalities: int = 6, use_gradient_checkpointing: bool = False):
         super().__init__()
         frozen_switti.requires_grad_(False)
         self.frozen_switti = frozen_switti

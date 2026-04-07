@@ -170,7 +170,7 @@ class SwittiControlTrainer:
         self.device = device
         self.grad_accum = args.grad_accum
         self.ctrl_dropout_prob = getattr(args, "ctrl_dropout_prob", 0.3)
-        self.num_modalities = getattr(args, "num_modalities", 5)
+        self.num_modalities = getattr(args, "num_modalities", 6)
         self.log_modality = (getattr(args, "control_modalities", None) or ["canny"])[0]
 
         # Load logging data (prompts + control images for eval visualisation)

@@ -10,6 +10,7 @@ Modality IDs:
     seg:    2
     normal: 3
     hed:    4
+    gray:   5
     null:   num_modalities  (used for CFG dropout)
 """
 import csv

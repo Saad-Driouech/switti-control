@@ -90,7 +90,7 @@ def build_everything(args: arg_util.Args):
         reso=args.data_load_reso,
     ).to(device)
 
-    num_modalities = getattr(args, "num_modalities", 5)
+    num_modalities = getattr(args, "num_modalities", 6)
     control_net_wo_ddp = SwittiControlNet(
         frozen_switti=frozen_switti,
         num_modalities=num_modalities,
