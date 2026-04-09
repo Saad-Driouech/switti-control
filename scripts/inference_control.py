@@ -129,7 +129,7 @@ def parse_args():
     p.add_argument("--control_encoder_ckpt", default=None,
                    help="timm model name for pretrained ViT backbone (e.g. vit_base_patch14_dinov2)")
     p.add_argument("--control_context_dim", type=int, default=384)
-    p.add_argument("--control_fusion", default="cross", choices=["cross", "add"])
+    p.add_argument("--control_fusion", default=None, choices=["cross", "add"])
     p.add_argument("--control_pretrained", action="store_true", default=True)
 
     # --- Generation ---
