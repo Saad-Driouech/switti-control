@@ -6,6 +6,7 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 from controlnet_aux import HEDdetector, OpenposeDetector
+from pycocotools.coco import COCO
 
 
 # Optional MiDaS depth model
@@ -124,6 +125,42 @@ def generate_openpose(img):
     return np.array(pose_map.convert("RGB"))
 
 
+# COCO category ID → fixed RGB color (ADE20K-style palette, deterministic)
+def _coco_category_color(cat_id: int) -> tuple:
+    """Map a COCO category ID to a unique RGB color using a fixed hash."""
+    np.random.seed(cat_id)
+    return tuple(np.random.randint(0, 256, size=3).tolist())
+
+
+def generate_seg(img, image_id: int, coco_api: COCO) -> np.ndarray:
+    """
+    Render a colorized instance segmentation map for a COCO image.
+
+    Each instance is filled with the fixed color of its category. Pixels not
+    covered by any annotation stay black (background).
+
+    Args:
+        img:      numpy uint8 [H, W, 3] RGB — used only for shape
+        image_id: COCO image ID (int)
+        coco_api: loaded pycocotools COCO object
+
+    Returns:
+        numpy uint8 [H, W, 3] RGB colorized segmentation map
+    """
+    h, w = img.shape[:2]
+    seg_map = np.zeros((h, w, 3), dtype=np.uint8)
+
+    ann_ids = coco_api.getAnnIds(imgIds=image_id, iscrowd=False)
+    anns = coco_api.loadAnns(ann_ids)
+
+    for ann in anns:
+        mask = coco_api.annToMask(ann)  # binary [H, W]
+        color = _coco_category_color(ann["category_id"])
+        seg_map[mask == 1] = color
+
+    return seg_map
+
+
 def main(root_dir, subset="train2014"):
     input_dir = os.path.join(root_dir, subset)
     control_root = os.path.join(root_dir, "val_control" if "val" in subset else "train_control")
@@ -134,10 +171,24 @@ def main(root_dir, subset="train2014"):
         if f.split(".")[-1].lower() in ("jpg", "jpeg", "png")
     ]
 
+    # Load COCO annotations for segmentation
+    ann_file = os.path.join(root_dir, "annotations", f"instances_{subset}.json")
+    if os.path.exists(ann_file):
+        print(f"Loading COCO annotations from {ann_file} ...")
+        coco_api = COCO(ann_file)
+        # Build filename → image_id lookup
+        fname_to_id = {img["file_name"]: img["id"] for img in coco_api.dataset["images"]}
+        use_seg = True
+    else:
+        print(f"[Warning] Annotations not found at {ann_file}, skipping segmentation.")
+        coco_api = None
+        fname_to_id = {}
+        use_seg = False
+
     # Prepare control folders
     folders = [
         "canny", "sobel", "laplacian", "normals", "gray", "hed", "openpose"
-    ] + (["depth"] if USE_DEPTH else [])
+    ] + (["depth"] if USE_DEPTH else []) + (["seg"] if use_seg else [])
 
     for f in folders:
         ensure_dir(os.path.join(control_root, f))
@@ -158,6 +209,9 @@ def main(root_dir, subset="train2014"):
         }
         if USE_DEPTH:
             tasks["depth"] = generate_depth
+        if use_seg and fname in fname_to_id:
+            image_id = fname_to_id[fname]
+            tasks["seg"] = lambda img, iid=image_id: generate_seg(img, iid, coco_api)
 
         pending = {
             ctrl: fn for ctrl, fn in tasks.items()
