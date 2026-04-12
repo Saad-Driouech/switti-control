@@ -152,7 +152,7 @@ class Args(Tap):
     ctrl_maps_dir: str = None                     # pre-computed control map directory
     ctrl_strength: float = 1.0                    # inference-time control strength multiplier
     control_ckpt: str = None                      # path to trained control weights
-    num_modalities: int = 6                       # number of spatial modalities
+    num_modalities: int = 7                       # number of spatial modalities
     ctrl_dropout_prob: float = 0.1               # prob. of replacing modality with null ID
 
     # data

@@ -68,7 +68,7 @@ class SwittiControlPipeline(SwittiPipeline):
         torch_dtype=torch.bfloat16,
         device="cuda",
         reso=1024,
-        num_modalities=6,
+        num_modalities=7,
     ):
         from models.switti import SwittiHF
         from models.control_switti import SwittiControlNet
