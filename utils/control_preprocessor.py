@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import torch
-from controlnet_aux import HEDdetector, OpenposeDetector
+from controlnet_aux import HEDdetector, OpenposeDetector, NormalBaeDetector
 from pycocotools.coco import COCO
 
 
@@ -33,6 +33,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 hed_detector = HEDdetector.from_pretrained("lllyasviel/Annotators")
 openpose_detector = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
+normal_detector = NormalBaeDetector.from_pretrained("lllyasviel/Annotators")
 
 
 def ensure_dir(path):
@@ -68,15 +69,12 @@ def generate_laplacian(img):
 
 
 def generate_normals(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
-    sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
-    normals = np.zeros((*gray.shape, 3), dtype=np.float32)
-    normals[..., 0] = sobelx
-    normals[..., 1] = sobely
-    normals[..., 2] = 1.0
-    normals = cv2.normalize(normals, None, 0, 255, cv2.NORM_MINMAX)
-    return normals.astype(np.uint8)
+    """img: numpy uint8 [H, W, 3] RGB. Returns surface normal map as RGB numpy [H, W, 3] uint8.
+    Uses NormalBae (Bae et al.) via controlnet_aux — same estimator as ControlNet preprocessing."""
+    h, w = img.shape[:2]
+    pil_img = Image.fromarray(img)
+    normal_map = normal_detector(pil_img, detect_resolution=min(h, w), image_resolution=min(h, w))
+    return np.array(normal_map.convert("RGB"))
 
 
 def generate_depth(img):
