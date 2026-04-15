@@ -103,7 +103,7 @@ def apply_control_only_freeze(
         if clean.startswith("control_encoder"):
             keep = True
 
-            if freeze_control_backbone and "control_encoder.encoder.backbone" in clean:
+            if freeze_control_backbone and "control_encoder.encoder.encoder.backbone" in clean:
                 keep = False  # freeze the backbone parameters
                 # BUT allow projection heads to stay trainable if asked
                 if ".proj" in clean or clean.endswith("proj"):
