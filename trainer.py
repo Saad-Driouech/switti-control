@@ -106,7 +106,7 @@ def generate_logging_prompts_captions(
     # Optional: Stratify selection by simple heuristics or categories if available
     # Here, randomly sample num_select or less from filtered list
     if len(filtered_items) > num_select:
-        selected_items = random.sample(filtered_items, num_select)
+        selected_items = random.Random(42).sample(filtered_items, num_select)
     else:
         selected_items = filtered_items
 

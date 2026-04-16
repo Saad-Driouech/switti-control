@@ -153,6 +153,17 @@ def distributed_metrics_with_csv(
     rank_caption_batches, rank_filename_batches = prepare_prompts(csv_path, args.eval_batch_size, max_count)
     assert max_count % (args.eval_batch_size * dist.get_world_size()) == 0
     local_images, local_prompts = [], []
+    # Accumulate control images across all batches for correct metric computation
+    all_control_images = {ctrl: [] for ctrl in (args.control_types or [])}
+
+    if control_path is not None and args.control_types:
+        from utils.data import JointTransform
+        transform = JointTransform(
+            final_reso=args.data_load_reso,
+            mid_reso=args.mid_reso,
+            hflip_prob=0.0,  # deterministic for eval
+        )
+
     for captions_batch, filenames_batch in tqdm(
         zip(rank_caption_batches, rank_filename_batches),
         unit="batch",
@@ -164,20 +175,13 @@ def distributed_metrics_with_csv(
             caption for caption in captions_batch
             for _ in range(args.num_images_for_metrics)
         ]
-        
+
         # --------------------------------------------------------
         # CONTROL-IMAGE LOADING (ONLY if control_path is provided)
         # --------------------------------------------------------
         control_dict_batch = None
 
         if control_path is not None and args.control_types:
-            from utils.data import JointTransform
-            transform = JointTransform(
-                final_reso=args.data_load_reso,
-                mid_reso=args.mid_reso,
-                hflip_prob=0.0,  # deterministic for eval
-            )
-
             control_dict_batch = {ctrl: [] for ctrl in args.control_types}
 
             for fname in filenames_batch:
@@ -186,7 +190,7 @@ def distributed_metrics_with_csv(
                     for ctrl in args.control_types:
                         # Handle missing filename
                         if fname == "None":
-                            dummy = torch.zeros(3, args.final_reso, args.final_reso)
+                            dummy = torch.zeros(3, args.data_load_reso, args.data_load_reso)
                             control_dict_batch[ctrl].append(dummy)
                             continue
 
@@ -204,16 +208,17 @@ def distributed_metrics_with_csv(
                                 control_dict_batch[ctrl].append(control_tensor)
                             except Exception as e:
                                 print(f"[Warning] Failed to process {ctrl_fp}: {e}")
-                                dummy = torch.zeros(3, args.final_reso, args.final_reso)
+                                dummy = torch.zeros(3, args.data_load_reso, args.data_load_reso)
                                 control_dict_batch[ctrl].append(dummy)
                         else:
-                            dummy = torch.zeros(3, args.final_reso, args.final_reso)
+                            dummy = torch.zeros(3, args.data_load_reso, args.data_load_reso)
                             control_dict_batch[ctrl].append(dummy)
 
-            # Stack into tensors (N, 3, H, W)
+            # Stack into tensors for this batch (B, 3, H, W)
             for ctrl in args.control_types:
                 control_dict_batch[ctrl] = torch.stack(control_dict_batch[ctrl], dim=0)
-        
+                all_control_images[ctrl].append(control_dict_batch[ctrl])
+
         image_tensors = pipe(
             prompt=texts,
             seed=args.seed,
@@ -228,6 +233,14 @@ def distributed_metrics_with_csv(
 
         local_images.extend(image_tensors)
         local_prompts.extend(texts)
+
+    # Concatenate accumulated control images from all batches
+    all_control_dict = None
+    if control_path is not None and args.control_types:
+        all_control_dict = {
+            ctrl: torch.cat(all_control_images[ctrl], dim=0)
+            for ctrl in args.control_types
+        }
 
     local_images = torch.stack(local_images).cuda()
     
@@ -244,16 +257,13 @@ def distributed_metrics_with_csv(
 
     # NEW: Control-specific metrics
     control_metrics = {}
-    if control_path is not None and args.control_types:
-        # Collect all control images used during generation
-        # (Need to save them during generation - see Step 3)
-        
+    if control_path is not None and args.control_types and all_control_dict is not None:
         for ctrl_type in args.control_types:
             ctrl_metrics = calculate_control_metrics(
                 pil_images,
-                control_dict_batch,  # From generation
+                all_control_dict,  # All batches accumulated
                 ctrl_type,
-                device=dist.get_device(),  # Pass device for LPIPS
+                device=dist.get_device(),
             )
             control_metrics.update({f"{ctrl_type}_{k}": v for k, v in ctrl_metrics.items()})
     
