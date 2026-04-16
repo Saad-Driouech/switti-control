@@ -76,6 +76,7 @@ def _ensure_pil(img):
 # ============================================================
 
 _hed_detector = None
+_depth_estimator = None
 _openpose_detector = None
 _seg_model = None
 _seg_model_device = None
@@ -87,6 +88,14 @@ def _get_hed_detector():
         from controlnet_aux import HEDdetector
         _hed_detector = HEDdetector.from_pretrained("lllyasviel/Annotators")
     return _hed_detector
+
+
+def _get_depth_estimator():
+    global _depth_estimator
+    if _depth_estimator is None:
+        from controlnet_aux import MidasDetector
+        _depth_estimator = MidasDetector.from_pretrained("lllyasviel/Annotators")
+    return _depth_estimator
 
 
 def _get_openpose_detector():
@@ -314,114 +323,83 @@ def calculate_edge_f1(generated_images, control_images, threshold1=100, threshol
 # DEPTH CONTROL METRICS
 # ============================================================
 
-def calculate_depth_correlation(generated_images, control_images):
+def calculate_depth_metrics(generated_images, control_images):
     """
-    Calculate depth correlation (Pearson correlation).
+    Estimate depth from generated images using MiDaS and compare to control depth maps.
 
-    This is the ONLY mathematically sound depth metric when using grayscale as proxy.
-    Correlation is scale-invariant, so independent normalization is fine.
+    Follows the scale-invariant depth evaluation protocol from Eigen et al. 2014,
+    adapted for relative/normalized depth (both maps have no metric units).
+
+    Pipeline:
+        1. Run MiDaS on each generated image to obtain predicted relative depth.
+        2. Convert control depth map to grayscale [0,1].
+        3. Normalize both to [0,1] independently (scale-invariant comparison).
+        4. Compute AbsRel, RMSE, and threshold accuracy δ < 1.25.
+
+    Metrics:
+        'depth_abs_rel': Mean absolute relative error (lower is better)
+        'depth_rmse':    RMSE on normalized depth (lower is better)
+        'depth_delta1':  Fraction of pixels where max(pred/gt, gt/pred) < 1.25
+                         (higher is better; standard δ₁ accuracy)
 
     Args:
         generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
         control_images: List of Tensors (3, 512, 512, float32 [-1,1])
 
     Returns:
-        float: Pearson correlation [0, 1], higher is better
+        dict: {'depth_abs_rel': float, 'depth_rmse': float, 'depth_delta1': float}
     """
-    correlations = []
+    detector = _get_depth_estimator()
 
-    for gen_img, ctrl_img in zip(generated_images, control_images):
-        if ctrl_img is None:
-            continue
-
-        # Ensure both are PIL RGB [0, 255] uint8
-        gen_img = _ensure_pil(gen_img)
-        ctrl_img = _ensure_pil(ctrl_img)
-
-        # Convert to grayscale [0, 255] uint8
-        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)
-        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)
-
-        # Normalize independently (OK for correlation, which is scale-invariant)
-        gen_norm = (gen_gray - gen_gray.min()) / (gen_gray.max() - gen_gray.min() + 1e-8)
-        ctrl_norm = (ctrl_gray - ctrl_gray.min()) / (ctrl_gray.max() - ctrl_gray.min() + 1e-8)
-
-        # Calculate Pearson correlation
-        correlation = np.corrcoef(gen_norm.flatten(), ctrl_norm.flatten())[0, 1]
-
-        # Clip to [0, 1] (negative correlation = bad)
-        correlations.append(max(0.0, correlation))
-
-    return float(np.mean(correlations)) if correlations else 0.0
-
-
-def calculate_depth_mae(generated_images, control_images):
-    """
-    Calculate Mean Absolute Error in the SHARED [0, 255] space.
-
-    This preserves scale information by NOT normalizing independently.
-    Both images are converted to grayscale [0, 255], then MAE is computed directly.
-
-    Args:
-        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
-        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
-
-    Returns:
-        float: MAE in [0, 1] range, lower is better (0 = perfect match)
-    """
-    mae_scores = []
-
-    for gen_img, ctrl_img in zip(generated_images, control_images):
-        if ctrl_img is None:
-            continue
-
-        # Ensure both are PIL RGB [0, 255] uint8
-        gen_img = _ensure_pil(gen_img)
-        ctrl_img = _ensure_pil(ctrl_img)
-
-        # Convert to grayscale [0, 255] - SAME SCALE, NO INDEPENDENT NORMALIZATION
-        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)
-        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)
-
-        # Calculate MAE in shared [0, 255] space
-        mae = np.mean(np.abs(gen_gray - ctrl_gray))
-        mae_scores.append(mae)
-
-    return float(np.mean(mae_scores) / 255.0) if mae_scores else 0.0
-
-
-def calculate_depth_rmse(generated_images, control_images):
-    """
-    Calculate RMSE in the SHARED [0, 255] space.
-
-    This preserves scale information by NOT normalizing independently.
-
-    Args:
-        generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
-        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
-
-    Returns:
-        float: RMSE in [0, 1] range, lower is better (0 = perfect match)
-    """
+    abs_rel_scores = []
     rmse_scores = []
+    delta1_scores = []
 
     for gen_img, ctrl_img in zip(generated_images, control_images):
         if ctrl_img is None:
             continue
 
-        # Ensure both are PIL RGB [0, 255] uint8
-        gen_img = _ensure_pil(gen_img)
-        ctrl_img = _ensure_pil(ctrl_img)
+        gen_pil = _ensure_pil(gen_img)
+        ctrl_pil = _ensure_pil(ctrl_img)
+        h, w = gen_pil.height, gen_pil.width
 
-        # Convert to grayscale [0, 255] - SAME SCALE
-        gen_gray = np.array(gen_img.convert('L')).astype(np.float64)
-        ctrl_gray = np.array(ctrl_img.convert('L')).astype(np.float64)
+        # Run MiDaS on generated image → predicted depth map (same detector used in preprocessing)
+        gen_depth_pil = detector(gen_pil, detect_resolution=min(h, w), image_resolution=min(h, w))
+        gen_depth = np.array(gen_depth_pil.convert('L')).astype(np.float64)  # [H, W] [0,255]
 
-        # Calculate RMSE in shared [0, 255] space
-        rmse = np.sqrt(np.mean((gen_gray - ctrl_gray) ** 2))
+        # Control depth map to grayscale
+        ctrl_depth = np.array(ctrl_pil.convert('L')).astype(np.float64)  # [H, W] [0,255]
+
+        # Normalize both to [0,1] independently (scale-invariant)
+        gen_norm = (gen_depth - gen_depth.min()) / (gen_depth.max() - gen_depth.min() + 1e-8)
+        ctrl_norm = (ctrl_depth - ctrl_depth.min()) / (ctrl_depth.max() - ctrl_depth.min() + 1e-8)
+
+        # Only evaluate over pixels where control depth is non-trivial
+        eps = 1e-8
+        valid = ctrl_norm > eps
+        if not valid.any():
+            continue
+
+        # AbsRel: mean(|pred - gt| / gt) — standard Eigen et al. metric
+        abs_rel = float(np.mean(np.abs(gen_norm[valid] - ctrl_norm[valid]) / ctrl_norm[valid]))
+        abs_rel_scores.append(abs_rel)
+
+        # RMSE on normalized depth
+        rmse = float(np.sqrt(np.mean((gen_norm - ctrl_norm) ** 2)))
         rmse_scores.append(rmse)
 
-    return float(np.mean(rmse_scores) / 255.0) if rmse_scores else 0.0
+        # δ < 1.25 threshold accuracy: fraction of valid pixels satisfying the ratio bound
+        ratio = np.maximum(
+            gen_norm[valid] / (ctrl_norm[valid] + eps),
+            ctrl_norm[valid] / (gen_norm[valid] + eps),
+        )
+        delta1_scores.append(float(np.mean(ratio < 1.25)))
+
+    return {
+        'depth_abs_rel': float(np.mean(abs_rel_scores)) if abs_rel_scores else 0.0,
+        'depth_rmse':    float(np.mean(rmse_scores))    if rmse_scores    else 0.0,
+        'depth_delta1':  float(np.mean(delta1_scores))  if delta1_scores  else 0.0,
+    }
 
 
 # ============================================================
@@ -766,11 +744,8 @@ def calculate_control_metrics(generated_images, control_dict, control_type, devi
             metrics['edge_recall']    = edge_f1_results['recall']
 
         elif control_type == 'depth':
-            # Correlation (primary – scale-invariant)
-            metrics['depth_corr'] = calculate_depth_correlation(valid_gen, valid_ctrl)
-            # MAE / RMSE (preserve scale)
-            metrics['depth_mae']  = calculate_depth_mae(valid_gen, valid_ctrl)
-            metrics['depth_rmse'] = calculate_depth_rmse(valid_gen, valid_ctrl)
+            # AbsRel, RMSE, δ<1.25 on MiDaS-estimated depth (Eigen et al. 2014 protocol)
+            metrics.update(calculate_depth_metrics(valid_gen, valid_ctrl))
 
         elif control_type == 'normals':
             # Mean angular error + cosine similarity (standard in surface normal estimation)
