@@ -77,6 +77,8 @@ def _ensure_pil(img):
 
 _hed_detector = None
 _depth_estimator = None
+_depth_estimator_device = None
+_normal_estimator = None
 _openpose_detector = None
 _seg_model = None
 _seg_model_device = None
@@ -90,12 +92,24 @@ def _get_hed_detector():
     return _hed_detector
 
 
-def _get_depth_estimator():
-    global _depth_estimator
-    if _depth_estimator is None:
-        from controlnet_aux import MidasDetector
-        _depth_estimator = MidasDetector.from_pretrained("lllyasviel/Annotators")
+def _get_depth_estimator(device):
+    global _depth_estimator, _depth_estimator_device
+    if _depth_estimator is None or _depth_estimator_device != str(device):
+        from zoedepth.utils.config import get_config
+        from zoedepth.models.builder import build_model
+        config = get_config("zoedepth_nk", "infer")
+        config.do_resize = False
+        _depth_estimator = build_model(config).to(device).eval()
+        _depth_estimator_device = str(device)
     return _depth_estimator
+
+
+def _get_normal_estimator():
+    global _normal_estimator
+    if _normal_estimator is None:
+        from controlnet_aux import NormalBaeDetector
+        _normal_estimator = NormalBaeDetector.from_pretrained("lllyasviel/Annotators")
+    return _normal_estimator
 
 
 def _get_openpose_detector():
@@ -323,18 +337,16 @@ def calculate_edge_f1(generated_images, control_images, threshold1=100, threshol
 # DEPTH CONTROL METRICS
 # ============================================================
 
-def calculate_depth_metrics(generated_images, control_images):
+def calculate_depth_metrics(generated_images, control_images, device='cuda'):
     """
-    Estimate depth from generated images using MiDaS and compare to control depth maps.
+    Estimate depth from generated images using ZoeDepth and compare to control depth maps.
+
+    Mirrors the preprocessing pipeline exactly: the same ZoeDepth (zoedepth_nk) model
+    used to produce the control depth maps is run on the generated image.
 
     Follows the scale-invariant depth evaluation protocol from Eigen et al. 2014,
-    adapted for relative/normalized depth (both maps have no metric units).
-
-    Pipeline:
-        1. Run MiDaS on each generated image to obtain predicted relative depth.
-        2. Convert control depth map to grayscale [0,1].
-        3. Normalize both to [0,1] independently (scale-invariant comparison).
-        4. Compute AbsRel, RMSE, and threshold accuracy δ < 1.25.
+    adapted for normalized depth (both maps normalized to [0,1] before comparison
+    since no absolute metric scale is available at evaluation time).
 
     Metrics:
         'depth_abs_rel': Mean absolute relative error (lower is better)
@@ -344,12 +356,15 @@ def calculate_depth_metrics(generated_images, control_images):
 
     Args:
         generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
-        control_images: List of Tensors (3, 512, 512, float32 [-1,1])
+        control_images:   List of Tensors (3, 512, 512, float32 [-1,1])
+        device:           torch device for ZoeDepth inference
 
     Returns:
         dict: {'depth_abs_rel': float, 'depth_rmse': float, 'depth_delta1': float}
     """
-    detector = _get_depth_estimator()
+    from zoedepth.utils.misc import pil_to_batched_tensor
+
+    zoe = _get_depth_estimator(device)
 
     abs_rel_scores = []
     rmse_scores = []
@@ -363,14 +378,19 @@ def calculate_depth_metrics(generated_images, control_images):
         ctrl_pil = _ensure_pil(ctrl_img)
         h, w = gen_pil.height, gen_pil.width
 
-        # Run MiDaS on generated image → predicted depth map (same detector used in preprocessing)
-        gen_depth_pil = detector(gen_pil, detect_resolution=min(h, w), image_resolution=min(h, w))
-        gen_depth = np.array(gen_depth_pil.convert('L')).astype(np.float64)  # [H, W] [0,255]
+        # Run ZoeDepth on generated image — same model used in preprocessing
+        t = pil_to_batched_tensor(gen_pil).to(device)
+        with torch.no_grad():
+            output = zoe(t)
+        gen_depth = output['metric_depth'].squeeze().cpu().numpy()  # [H', W'] float
+        if gen_depth.shape != (h, w):
+            import cv2
+            gen_depth = cv2.resize(gen_depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Control depth map to grayscale
-        ctrl_depth = np.array(ctrl_pil.convert('L')).astype(np.float64)  # [H, W] [0,255]
+        # Control depth: grayscale [0,255] (stored as 3-channel RGB, take one channel)
+        ctrl_depth = np.array(ctrl_pil.convert('L')).astype(np.float64)  # [H, W]
 
-        # Normalize both to [0,1] independently (scale-invariant)
+        # Normalize both to [0,1] independently (scale-invariant comparison)
         gen_norm = (gen_depth - gen_depth.min()) / (gen_depth.max() - gen_depth.min() + 1e-8)
         ctrl_norm = (ctrl_depth - ctrl_depth.min()) / (ctrl_depth.max() - ctrl_depth.min() + 1e-8)
 
@@ -388,7 +408,7 @@ def calculate_depth_metrics(generated_images, control_images):
         rmse = float(np.sqrt(np.mean((gen_norm - ctrl_norm) ** 2)))
         rmse_scores.append(rmse)
 
-        # δ < 1.25 threshold accuracy: fraction of valid pixels satisfying the ratio bound
+        # δ < 1.25 threshold accuracy
         ratio = np.maximum(
             gen_norm[valid] / (ctrl_norm[valid] + eps),
             ctrl_norm[valid] / (gen_norm[valid] + eps),
@@ -408,11 +428,12 @@ def calculate_depth_metrics(generated_images, control_images):
 
 def calculate_normal_metrics(generated_images, control_images):
     """
-    Compute mean angular error (MAE) and mean cosine similarity between
-    surface normal maps of generated and control images.
+    Estimate surface normals from generated images using NormalBae and compare
+    to control normal maps.
 
-    Normal maps are encoded as RGB in [0, 255] where:
-        normal = (pixel / 127.5) - 1.0  →  XYZ in [-1, 1]
+    Mirrors the preprocessing pipeline exactly: the same NormalBaeDetector used to
+    produce the control normal maps is run on the generated image, giving estimated
+    normals that can be meaningfully compared to the control normals.
 
     Standard metrics from surface normal estimation literature
     (Eigen & Fergus 2015, Wang et al. 2015).
@@ -426,6 +447,8 @@ def calculate_normal_metrics(generated_images, control_images):
             'normal_mae_deg':    Mean angular error in degrees (lower is better)
             'normal_cosine_sim': Mean cosine similarity in [-1, 1] (higher is better)
     """
+    detector = _get_normal_estimator()
+
     mae_scores = []
     cos_scores = []
 
@@ -433,28 +456,31 @@ def calculate_normal_metrics(generated_images, control_images):
         if ctrl_img is None:
             continue
 
-        gen_np = np.array(_ensure_pil(gen_img)).astype(np.float32)   # [H, W, 3] [0,255]
-        ctrl_np = np.array(_ensure_pil(ctrl_img)).astype(np.float32)  # [H, W, 3] [0,255]
+        gen_pil = _ensure_pil(gen_img)
+        ctrl_pil = _ensure_pil(ctrl_img)
+        h, w = gen_pil.height, gen_pil.width
 
-        # Decode RGB → normal vector in [-1, 1]
-        gen_normals = gen_np / 127.5 - 1.0    # [H, W, 3]
+        # Run NormalBae on generated image — same detector used in preprocessing
+        gen_normal_pil = detector(gen_pil, detect_resolution=min(h, w), image_resolution=min(h, w))
+        gen_np  = np.array(gen_normal_pil.convert('RGB')).astype(np.float32)   # [H, W, 3] [0,255]
+        ctrl_np = np.array(ctrl_pil).astype(np.float32)                         # [H, W, 3] [0,255]
+
+        # Decode RGB → normal vector in [-1, 1]  (NormalBae encoding: n = pixel/127.5 - 1)
+        gen_normals  = gen_np  / 127.5 - 1.0  # [H, W, 3]
         ctrl_normals = ctrl_np / 127.5 - 1.0  # [H, W, 3]
 
         # L2-normalise (handle zero vectors)
-        gen_norm = np.linalg.norm(gen_normals, axis=-1, keepdims=True).clip(min=1e-8)
-        ctrl_norm = np.linalg.norm(ctrl_normals, axis=-1, keepdims=True).clip(min=1e-8)
-        gen_unit = gen_normals / gen_norm    # [H, W, 3]
-        ctrl_unit = ctrl_normals / ctrl_norm
+        gen_norms  = np.linalg.norm(gen_normals,  axis=-1, keepdims=True).clip(min=1e-8)
+        ctrl_norms = np.linalg.norm(ctrl_normals, axis=-1, keepdims=True).clip(min=1e-8)
+        gen_unit  = gen_normals  / gen_norms
+        ctrl_unit = ctrl_normals / ctrl_norms
 
         # Cosine similarity per pixel, then mean
-        cos_sim = np.sum(gen_unit * ctrl_unit, axis=-1)  # [H, W]
-        cos_sim = np.clip(cos_sim, -1.0, 1.0)
-        mean_cos = float(np.mean(cos_sim))
-        cos_scores.append(mean_cos)
+        cos_sim = np.sum(gen_unit * ctrl_unit, axis=-1).clip(-1.0, 1.0)  # [H, W]
+        cos_scores.append(float(np.mean(cos_sim)))
 
         # Angular error in degrees
-        angle_deg = np.degrees(np.arccos(cos_sim))      # [H, W]
-        mae_scores.append(float(np.mean(angle_deg)))
+        mae_scores.append(float(np.mean(np.degrees(np.arccos(cos_sim)))))
 
     return {
         'normal_mae_deg':    float(np.mean(mae_scores)) if mae_scores else 0.0,
@@ -744,8 +770,8 @@ def calculate_control_metrics(generated_images, control_dict, control_type, devi
             metrics['edge_recall']    = edge_f1_results['recall']
 
         elif control_type == 'depth':
-            # AbsRel, RMSE, δ<1.25 on MiDaS-estimated depth (Eigen et al. 2014 protocol)
-            metrics.update(calculate_depth_metrics(valid_gen, valid_ctrl))
+            # AbsRel, RMSE, δ<1.25 on ZoeDepth-estimated depth (Eigen et al. 2014 protocol)
+            metrics.update(calculate_depth_metrics(valid_gen, valid_ctrl, device=device))
 
         elif control_type == 'normals':
             # Mean angular error + cosine similarity (standard in surface normal estimation)
