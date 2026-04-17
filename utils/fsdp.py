@@ -18,7 +18,7 @@ def bcast_state_dict(state_dict):
         elif isinstance(data, dict):
             bcast_state_dict(data)
         else:
-            Exception(f"Unsupported type: {type(data)}")
+            raise Exception(f"Unsupported type: {type(data)}")
 
 
 def save_model_state(cur_iter: int, args, model: torch.nn.Module):

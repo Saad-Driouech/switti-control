@@ -92,7 +92,7 @@ def generate_logging_prompts_captions(
         filtered_items.append((fname_png, caps[0]))
 
     selected_items = (
-        random.sample(filtered_items, num_select)
+        random.Random(42).sample(filtered_items, num_select)
         if len(filtered_items) > num_select
         else filtered_items
     )
