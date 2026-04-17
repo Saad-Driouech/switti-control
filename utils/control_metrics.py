@@ -212,7 +212,7 @@ def calculate_depth_metrics(generated_images, control_images, device="cuda") -> 
             continue
 
         abs_rel_scores.append(float(np.mean(np.abs(gen_norm[valid] - ctrl_norm[valid]) / ctrl_norm[valid])))
-        rmse_scores.append(float(np.sqrt(np.mean((gen_norm - ctrl_norm) ** 2))))
+        rmse_scores.append(float(np.sqrt(np.mean((gen_norm[valid] - ctrl_norm[valid]) ** 2))))
         ratio = np.maximum(gen_norm[valid] / (ctrl_norm[valid] + eps),
                            ctrl_norm[valid] / (gen_norm[valid]  + eps))
         delta1_scores.append(float(np.mean(ratio < 1.25)))
