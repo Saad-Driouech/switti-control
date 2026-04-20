@@ -16,7 +16,7 @@ from models.switti import Switti, get_crop_condition
 
 __all__ = ["SpatialEncoder", "SwittiControlNet"]
 
-MODALITY_IDS = {"canny": 0, "depth": 1, "seg": 2, "normal": 3, "hed": 4, "gray": 5, "openpose": 6}
+MODALITY_IDS = {"canny": 0, "depth": 1, "seg": 2, "normals": 3, "hed": 4, "gray": 5, "openpose": 6}
 
 
 def _gn(num_channels: int) -> nn.GroupNorm:
