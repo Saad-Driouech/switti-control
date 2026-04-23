@@ -3,7 +3,7 @@ Inference pipeline for SwittiControlNet.
 
 Extends SwittiPipeline with scale-wise spatial control injection.
 Control is applied only to the conditional CFG branch; the null branch
-receives zero control tokens.
+uses the learned null modality embedding to match training-time control dropout.
 """
 from contextlib import contextmanager
 from typing import Optional
@@ -249,9 +249,19 @@ class SwittiControlPipeline(SwittiPipeline):
                 )  # (B, pn², C)
 
                 if cur_B == 2 * B:
-                    # Conditional branch gets ctrl tokens; null branch gets zeros
+                    # Null branch uses the learned null modality embedding (id=M),
+                    # matching the control dropout used during training.
+                    null_ids = torch.full(
+                        (B,), len(MODALITY_IDS), dtype=torch.long, device=self.device
+                    )
+                    null_mod_embed = control_net.spatial_encoder.modality_embed(null_ids)
+                    f_null = F.adaptive_avg_pool2d(ctrl_feat, (pn, pn))
+                    f_null = f_null + null_mod_embed[:, :, None, None]
+                    ctrl_tokens_null = control_net.spatial_encoder.proj(
+                        f_null.permute(0, 2, 3, 1).reshape(B, pn * pn, 128)
+                    )
                     ctrl_tokens_full = torch.cat(
-                        [ctrl_tokens_s, torch.zeros_like(ctrl_tokens_s)], dim=0
+                        [ctrl_tokens_s, ctrl_tokens_null], dim=0
                     )  # (2B, pn², C)
                 else:
                     ctrl_tokens_full = ctrl_tokens_s  # (B, pn², C)
