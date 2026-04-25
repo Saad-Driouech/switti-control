@@ -163,7 +163,8 @@ class CrossAttention(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         qk_norm: bool = False,
-        append_on_cache: bool = False
+        append_on_cache: bool = False,
+        positional_kv: bool = False,
     ):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -175,6 +176,9 @@ class CrossAttention(nn.Module):
         )
         self.qk_norm = qk_norm
         self.scale = 1 / math.sqrt(self.head_dim)
+        # When True, apply RoPE to K as well as Q (only valid when context length
+        # matches query length and positions are aligned 1:1, e.g. spatial control).
+        self.positional_kv = positional_kv
 
         self.q_norm = nn.LayerNorm(embed_dim, eps=1e-6, elementwise_affine=False)
         self.k_norm = nn.LayerNorm(embed_dim, eps=1e-6, elementwise_affine=False)
@@ -207,6 +211,10 @@ class CrossAttention(nn.Module):
         q = q.view(B, L, self.num_heads, self.head_dim)
         q = q.permute(0, 2, 1, 3)  # BHLc
 
+        # Apply RoPE to Q for positional cross-attention (e.g. spatial control)
+        if self.positional_kv and freqs_cis is not None:
+            q = apply_rotary_emb(q, freqs_cis=freqs_cis)
+
         if self.cached_k is None:
             # not using caches or first scale inference
             kv = self.to_kv(context).view(B, context_L, 2, -1)  # qkv: BL3D
@@ -220,6 +228,9 @@ class CrossAttention(nn.Module):
 
             v = v.view(B, context_L, self.num_heads, self.head_dim)
             v = v.permute(0, 2, 1, 3)  # BHLc
+
+            if self.positional_kv and freqs_cis is not None:
+                k = apply_rotary_emb(k, freqs_cis=freqs_cis)
 
             if self.caching:
                 self.cached_k = k
@@ -238,6 +249,9 @@ class CrossAttention(nn.Module):
 
                 k = k.view(B, context_L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
                 v = v.view(B, context_L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+                if self.positional_kv and freqs_cis is not None:
+                    k = apply_rotary_emb(k, freqs_cis=freqs_cis)
 
                 self.cached_k = torch.cat((self.cached_k, k), dim=2)  # grow along sequence dim
                 self.cached_v = torch.cat((self.cached_v, v), dim=2)
@@ -429,12 +443,12 @@ class AdaLNSelfCrossAttn(nn.Module):
                 proj_drop=drop,
                 qk_norm=qk_norm,
                 append_on_cache=True,  # accumulate across scales in AR mode
+                positional_kv=True,    # control K is spatially aligned with Q
             )
-            # Learnable control gate
-            if use_control_gate:
-                self.control_gate = nn.Parameter(torch.tensor([-2.0]))
-            else:
-                self.control_gate = None
+            # Zero-init scalar gate so the residual contribution starts at exactly 0
+            # and grows smoothly — replaces the old RMSNorm-on-cross-out which
+            # broke the smooth-start property of zero initialization.
+            self.control_gate = nn.Parameter(torch.zeros(1))
         else:
             self.cross_attn_control = None
             self.control_gate = None
@@ -461,9 +475,11 @@ class AdaLNSelfCrossAttn(nn.Module):
         self.cross_attention_control_norm1 = (
             RMSNorm(embed_dim, eps=norm_eps) if control_context_dim and self.control_fusion == "cross" else None
         )
-        self.cross_attention_control_norm2 = (
-            RMSNorm(embed_dim, eps=norm_eps) if control_context_dim and self.control_fusion == "cross" else None
-        )
+        # NOTE: norm2 on the cross-attn output was removed because RMSNorm with
+        # affine γ=1 rescales any non-zero output to unit RMS, which breaks the
+        # smooth-start property of zero-init proj. The zero-init scalar
+        # `control_gate` now provides the smooth ramp from zero.
+        self.cross_attention_control_norm2 = None
 
         self.ffn_norm1 = RMSNorm(embed_dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(embed_dim, eps=norm_eps)
@@ -526,19 +542,18 @@ class AdaLNSelfCrossAttn(nn.Module):
                 ).to(x.dtype)
 
                 if self.control_fusion == "cross" and self.cross_attn_control is not None:
-                    # Cross-attention fusion (uses structural mask)
+                    # Cross-attention fusion. K gets RoPE inside CrossAttention
+                    # (positional_kv=True) so spatial alignment with Q is enforced.
                     control_out = self.cross_attn_control(
                         self.cross_attention_control_norm1(x),
                         normed_ctrl,
                         context_attn_bias=None,
                         freqs_cis=freqs_cis,
                     )
-                    # Apply learned gate (sigmoid to keep in [0,1])
-                    if self.control_gate is not None:
-                        gate = torch.sigmoid(self.control_gate)
-                        x = x + gate * self.cross_attention_control_norm2(control_out)
-                    else:
-                        x = x + self.cross_attention_control_norm2(control_out)
+                    # Zero-init tanh-bounded gate: starts at exactly 0 and grows
+                    # smoothly. Replaces the old RMSNorm-on-output which created
+                    # a step discontinuity from zero to unit RMS.
+                    x = x + self.control_gate.tanh() * control_out
                 elif self.control_fusion == "add" and self.control_proj is not None:
                     # Additive fusion:
                     proj = self.control_proj(normed_ctrl).type_as(x)

@@ -153,20 +153,25 @@ def apply_control_only_freeze(
 
 def zero_init_control_layers(model):
     """
-    Initialize the output projection of control layers to zero.
-    This ensures at step 0: Output = Switti(Input) + 0
+    Initialize control fusion so the residual contribution starts at exactly 0.
+
+    - Additive fusion: zero `control_proj` (single linear, no chicken-and-egg).
+    - Cross-attention fusion: zero `control_gate` (the tanh-bounded scalar gate).
+      We deliberately DO NOT zero `cross_attn_control.proj` here, because that
+      would make every learnable cross-attn parameter receive zero gradient at
+      step 0 (chain rule: dL/d(to_q,to_kv,proj) ∝ gate · proj ≈ 0). The gate at 0
+      already guarantees `Output = SWITTI(Input) + 0` while letting Q/K/V/proj
+      receive non-zero gradients via the gate's gradient.
     """
-    print("[INFO] Zero-initializing control projection layers...")
-    
+    print("[INFO] Zero-initializing control fusion layers...")
+
     for name, module in model.named_modules():
-        # 1. For Cross-Attention Fusion (in basic_switti.py)
-        if hasattr(module, "cross_attn_control") and module.cross_attn_control is not None:
-            nn.init.zeros_(module.cross_attn_control.proj.weight)
-            if module.cross_attn_control.proj.bias is not None:
-                nn.init.zeros_(module.cross_attn_control.proj.bias)
-            print(f"  ✓ Zeroed {name}.cross_attn_control.proj")
-        
-        # 2. For Additive Fusion (if you use it)
+        # 1. Cross-attention fusion: zero the scalar gate.
+        if hasattr(module, "control_gate") and isinstance(module.control_gate, nn.Parameter):
+            nn.init.zeros_(module.control_gate)
+            print(f"  ✓ Zeroed {name}.control_gate")
+
+        # 2. Additive fusion: zero the projection.
         if hasattr(module, "control_proj") and module.control_proj is not None:
             nn.init.zeros_(module.control_proj.weight)
             if module.control_proj.bias is not None:
