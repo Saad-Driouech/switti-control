@@ -249,10 +249,11 @@ class SwittiControlPipeline(SwittiPipeline):
                 )  # (B, pn², C)
 
                 if cur_B == 2 * B:
-                    # Null branch uses the learned null modality embedding (id=M),
-                    # matching the control dropout used during training.
+                    # Null branch uses the learned null modality embedding (last
+                    # row of the table), matching control dropout during training.
+                    null_idx = control_net.spatial_encoder.modality_embed.num_embeddings - 1
                     null_ids = torch.full(
-                        (B,), len(MODALITY_IDS), dtype=torch.long, device=self.device
+                        (B,), null_idx, dtype=torch.long, device=self.device
                     )
                     null_mod_embed = control_net.spatial_encoder.modality_embed(null_ids)
                     f_null = F.adaptive_avg_pool2d(ctrl_feat, (pn, pn))
