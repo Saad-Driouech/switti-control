@@ -15,7 +15,7 @@ from models import Switti, VQVAE, VQVAEHF, build_models
 from models.basic_switti import AdaLNSelfCrossAttn
 from utils import arg_util, misc
 from utils.amp_sc import AmpOptimizer
-from utils.fsdp import load_model_state, save_model_state
+from utils.fsdp import load_model_state, load_optimizer_state, save_model_state
 from utils.lr_control import filter_params, lr_wd_annealing
 from utils.data import build_dataset, coco_collate_fn
 from utils.data_sampler import DistInfiniteBatchSampler
@@ -136,6 +136,11 @@ def build_everything(args: arg_util.Args):
     )
     del names, paras, para_groups
 
+    # Restore optimizer / AMP scaler / RNG state (must be after FSDP wrap +
+    # optimizer construction). load_model_state above only loads weights.
+    if start_it > 0:
+        load_optimizer_state(args, switti, switti_optimizer)
+
     # build data
     print(f"[build PT data] ...\n")
     print(f"global bs={args.glb_batch_size}, local bs={args.batch_size}")
@@ -212,7 +217,7 @@ def main_training():
             tb_lg.update(head="AR_opt_grad/grad", grad_clip=args.tclip)
 
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
-            save_model_state(cur_iter, args, trainer.switti)
+            save_model_state(cur_iter, args, trainer.switti, switti_optimizer)
             # Calculate metrics
             trainer.pipe.switti.eval()
             for eval_set_name in ['coco', 'mjhq']:

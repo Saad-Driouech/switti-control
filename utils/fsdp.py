@@ -3,7 +3,7 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.distributed.fsdp import FullStateDictConfig
+from torch.distributed.fsdp import FullStateDictConfig, FullOptimStateDictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
 
@@ -21,16 +21,35 @@ def bcast_state_dict(state_dict):
             raise Exception(f"Unsupported type: {type(data)}")
 
 
-def save_model_state(cur_iter: int, args, model: torch.nn.Module):
-    """Save model, optimizer state dict and training args to be loaded via load_training_state"""
+def save_model_state(cur_iter: int, args, model: torch.nn.Module, amp_optimizer=None):
+    """Save model weights, optimizer state, AMP scaler, RNG state, and training args.
+
+    The optimizer / scaler / RNG state is required to truly resume training
+    without resetting Adam moments and AMP scale (which causes a regression
+    spike on every restart).
+    """
+
+    is_fsdp = isinstance(model, FSDP)
+    optim = amp_optimizer.optimizer if amp_optimizer is not None else None
 
     # Save model state
     with FSDP.state_dict_type(
         model,
         StateDictType.FULL_STATE_DICT,
         FullStateDictConfig(offload_to_cpu=False, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
     ):
         model_state_dict = model.state_dict()
+
+        # Optimizer state must be gathered collectively from all ranks; only
+        # rank 0 ends up with the full dict (rank0_only=True).
+        optim_state_dict = None
+        if optim is not None:
+            if is_fsdp:
+                optim_state_dict = FSDP.optim_state_dict(model, optim)
+            else:
+                optim_state_dict = optim.state_dict()
+
         if dist.is_master():
             os.makedirs(args.local_out_dir_path, exist_ok=True)
             model_save_path = os.path.join(
@@ -41,6 +60,26 @@ def save_model_state(cur_iter: int, args, model: torch.nn.Module):
             metadata = {"iter": cur_iter, "args": args.state_dict()}
             metadata_save_path = os.path.join(args.local_out_dir_path, "metadata.pt")
             torch.save(metadata, metadata_save_path)
+
+            optim_payload = None
+            if amp_optimizer is not None:
+                optim_payload = {
+                    "iter": cur_iter,
+                    "optim": optim_state_dict,
+                    "scaler": (
+                        amp_optimizer.scaler.state_dict()
+                        if amp_optimizer.scaler is not None
+                        else None
+                    ),
+                    "rng": {
+                        "torch": torch.get_rng_state(),
+                        "cuda": torch.cuda.get_rng_state_all(),
+                    },
+                }
+                torch.save(
+                    optim_payload,
+                    os.path.join(args.local_out_dir_path, "optim_state_dict.pt"),
+                )
 
             # Save global checkpoints
             if cur_iter % args.global_save_iters == 0:
@@ -53,6 +92,15 @@ def save_model_state(cur_iter: int, args, model: torch.nn.Module):
                     args.local_out_dir_path, f"metadata_{cur_iter}.pt"
                 )
                 torch.save(metadata, metadata_save_path)
+
+                if optim_payload is not None:
+                    torch.save(
+                        optim_payload,
+                        os.path.join(
+                            args.local_out_dir_path,
+                            f"optim_{cur_iter}_state_dict.pt",
+                        ),
+                    )
 
             print(f"Saved model and optimizer state dicts to {args.local_out_dir_path}")
 
@@ -112,3 +160,67 @@ def load_model_state(args, model: torch.nn.Module) -> int:
     start_iter = start_iter_t.item()
     dist.barrier()
     return start_iter
+
+
+def load_optimizer_state(args, model: torch.nn.Module, amp_optimizer) -> None:
+    """Load optimizer / AMP scaler / RNG state saved by save_model_state.
+
+    Must be called after the optimizer is constructed and the model is wrapped
+    in FSDP (matching the wrapping at save time). Without this, every resume
+    starts Adam moments from zero and the loss spikes for thousands of iters.
+    """
+    optim_path = os.path.join(args.local_out_dir_path, "optim_state_dict.pt")
+    if not os.path.exists(optim_path):
+        if dist.is_master():
+            print(f"[load_optimizer_state] no optim_state_dict.pt at {args.local_out_dir_path} — fresh optimizer")
+        return
+
+    is_fsdp = isinstance(model, FSDP)
+    optim = amp_optimizer.optimizer
+
+    # Rank 0 loads from disk, all ranks participate in the FSDP collective.
+    if dist.is_master():
+        payload = torch.load(optim_path, map_location="cpu", weights_only=False)
+    else:
+        payload = None
+
+    full_optim_state = payload["optim"] if payload is not None else None
+    if is_fsdp:
+        sharded = FSDP.optim_state_dict_to_load(
+            model=model,
+            optim=optim,
+            optim_state_dict=full_optim_state,
+        )
+        optim.load_state_dict(sharded)
+    else:
+        if full_optim_state is not None:
+            optim.load_state_dict(full_optim_state)
+
+    # Scaler + RNG: rank-0 has the saved state; broadcast scalar fields via
+    # AMP scaler (small, no harm to load on every rank from disk).
+    if payload is None and dist.is_master() is False:
+        # other ranks read the small scaler/rng portion themselves
+        payload = torch.load(optim_path, map_location="cpu", weights_only=False)
+
+    if amp_optimizer.scaler is not None and payload.get("scaler") is not None:
+        try:
+            amp_optimizer.scaler.load_state_dict(payload["scaler"])
+        except Exception as e:
+            print(f"[load_optimizer_state] scaler load failed: {e}")
+
+    rng = payload.get("rng")
+    if rng is not None:
+        try:
+            torch.set_rng_state(rng["torch"])
+            cuda_rng = rng["cuda"]
+            num_dev = torch.cuda.device_count()
+            if isinstance(cuda_rng, list) and len(cuda_rng) == num_dev:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            elif isinstance(cuda_rng, list) and len(cuda_rng) > 0:
+                torch.cuda.set_rng_state(cuda_rng[dist.get_local_rank() % len(cuda_rng)])
+        except Exception as e:
+            print(f"[load_optimizer_state] rng restore failed: {e}")
+
+    if dist.is_master():
+        print(f"[load_optimizer_state] restored optimizer/scaler/rng from iter {payload.get('iter')}")
+    dist.barrier()
