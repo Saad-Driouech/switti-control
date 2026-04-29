@@ -1,0 +1,96 @@
+# =============================================================
+# Universal evaluation config — Approach 1 (DINOv2 + cross-attn)
+# =============================================================
+# Edit `runs:` to point to YOUR checkpoints and the right encoder
+# args.  All runs share the same global block (sample size, seed,
+# COCO csv, control image dir, generation hyperparams).
+
+# ---- Evaluation set ----
+coco_csv: eval_prompts/coco.csv
+control_path: /home/woody/iwnt/iwnt134h/switti/data/val_control
+num_samples: 2000
+seed: 42
+eval_batch_size: 4   # global block = eval_batch_size * world_size; subset is truncated to a multiple
+
+# ---- Generation ----
+reso: 512
+depth: 30
+guidance: 6.0
+top_k: 400
+top_p: 0.95
+control_end_si: 8
+mid_reso: 1.125
+
+# ---- Base / shared assets ----
+pretrained_switti: yresearch/Switti
+vae_ckpt: yresearch/VQVAE-Switti
+clip_model_name_or_path: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+pickscore_model_name_or_path: yuvalkirstain/PickScore_v1
+image_reward_path: ImageReward-v1.0
+coco_ref_stats_path: stats/fid_stats_mscoco256_val.npz
+inception_path: stats/pt_inception-2015-12-05-6726825d.pth
+
+# ---- Runs ----
+# Each entry overrides the model with a fine-tuned ckpt and selects
+# the matching control encoder architecture used at training time.
+# ckpt: path to model_state_dict.pt produced by save_model_state.
+runs:
+  # ---- Optional baseline: pretrained Switti, no control ----
+  # - name: baseline_pretrained
+  #   modality: null
+  #   ckpt: null
+  #   control_encoder_type: null
+
+  - name: approach1_canny
+    modality: canny
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_swittiP_vaeP_dinov2b_canny_cross_freeze_v2/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: cross
+    control_pretrained: true
+
+  - name: approach1_depth
+    modality: depth
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_swittiP_vaeP_dinov2b_depth_cross_freeze_v2/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: cross
+    control_pretrained: true
+
+  - name: approach1_gray
+    modality: gray
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_swittiP_vaeP_dinov2b_gray_cross_freeze_v2/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: cross
+    control_pretrained: true
+
+  - name: approach1_hed
+    modality: hed
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_swittiP_vaeP_dinov2b_hed_cross_freeze_v2/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: cross
+    control_pretrained: true
+
+  - name: approach1_normals
+    modality: normals
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_swittiP_vaeP_dinov2b_normals_cross_freeze_v2/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: cross
+    control_pretrained: true
+
+  - name: approach1_seg
+    modality: seg
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_swittiP_vaeP_dinov2b_seg_cross_freeze_v2/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: cross
+    control_pretrained: true
