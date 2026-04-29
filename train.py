@@ -450,7 +450,7 @@ def main_training():
             tb_lg.update(head="Train", control_strength=control_strength)
 
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
-            save_model_state(cur_iter, args, trainer.switti, switti_optimizer)
+            save_model_state(cur_iter, args, trainer.switti, trainer.optimizer)
             # Calculate metrics
             trainer.pipe.switti.eval()
             for eval_set_name in ['coco', 'mjhq']:
