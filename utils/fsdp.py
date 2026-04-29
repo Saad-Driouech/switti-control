@@ -93,14 +93,9 @@ def save_model_state(cur_iter: int, args, model: torch.nn.Module, amp_optimizer=
                 )
                 torch.save(metadata, metadata_save_path)
 
-                if optim_payload is not None:
-                    torch.save(
-                        optim_payload,
-                        os.path.join(
-                            args.local_out_dir_path,
-                            f"optim_{cur_iter}_state_dict.pt",
-                        ),
-                    )
+                # Numbered optimizer snapshots are intentionally NOT written:
+                # auto_resume only reads the rolling optim_state_dict.pt, and
+                # numbered Adam states have no use case (~40 GB each).
 
             print(f"Saved model and optimizer state dicts to {args.local_out_dir_path}")
 
