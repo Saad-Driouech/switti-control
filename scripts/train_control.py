@@ -41,7 +41,7 @@ from models.control_pipeline import SwittiControlPipeline
 from trainer_control import SwittiControlTrainer
 from utils import arg_util, misc
 from utils.amp_sc import AmpOptimizer
-from utils.fsdp import load_model_state, save_model_state
+from utils.fsdp import load_model_state, load_optimizer_state, save_model_state
 from utils.lr_control import filter_params, lr_wd_annealing
 from utils.control_data import build_control_dataset, control_collate_fn
 from utils.data_sampler import DistInfiniteBatchSampler
@@ -168,6 +168,9 @@ def build_everything(args: arg_util.Args):
     )
     del names, paras, para_groups
 
+    if start_it > 0:
+        load_optimizer_state(args, control_net, control_optimizer)
+
     # -------------------------------------------------------------------------
     # Dataset and dataloader
     # -------------------------------------------------------------------------
@@ -253,7 +256,7 @@ def main_training():
             tb_lg.update(head="Control_opt_grad/grad", grad_norm=grad_norm)
 
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
-            save_model_state(cur_iter, args, trainer.control_net)
+            save_model_state(cur_iter, args, trainer.control_net, trainer.optimizer)
 
             # Calculate metrics
             trainer.pipe.control_net.eval()
