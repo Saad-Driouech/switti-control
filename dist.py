@@ -120,7 +120,7 @@ def local_host_gather(data):
 
 
 def in_distributed_mode():
-    return dist is not None
+    return dist.is_initialized()
 
 
 def is_master():
