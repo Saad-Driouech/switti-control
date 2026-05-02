@@ -258,7 +258,8 @@ def distributed_metrics_with_csv(
             k: torch.tensor(v).cuda() for k, v in ctrl_metrics.items()
         }
 
-    dist.barrier()
+    if dist.initialized():
+        dist.barrier()
     return local_images, local_pick_score, local_clip_score, local_image_reward, local_control_metric_tensors
 
 
