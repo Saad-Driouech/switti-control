@@ -181,14 +181,25 @@ def load_optimizer_state(args, model: torch.nn.Module, amp_optimizer) -> None:
 
     full_optim_state = payload["optim"] if payload is not None else {}
     if is_fsdp:
-        sharded = FSDP.optim_state_dict_to_load(
-            model=model,
-            optim=optim,
-            optim_state_dict=full_optim_state,
-        )
+        # The optimizer state was saved with rank0_only=True, so only rank 0
+        # has the full dict. Wrapping with the matching state_dict_type context
+        # tells FSDP to scatter from rank 0 to all ranks internally — without
+        # it FSDP validates the dict on every rank and rejects {} with a
+        # ValueError ("must have the keys 'state'").
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True),
+            FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            sharded = FSDP.optim_state_dict_to_load(
+                model=model,
+                optim=optim,
+                optim_state_dict=full_optim_state,
+            )
         optim.load_state_dict(sharded)
     else:
-        if full_optim_state is not None:
+        if full_optim_state:
             optim.load_state_dict(full_optim_state)
 
     # Scaler + RNG: rank-0 has the saved state; broadcast scalar fields via
