@@ -1,0 +1,42 @@
+# ============================================================
+# Evaluation config for Approach 2 (SwittiControlNet)
+# ============================================================
+# Usage:
+#   python scripts/evaluate.py \
+#       --config scripts/eval_config_example.yaml \
+#       --out_dir /path/to/eval_out/
+
+# ---- Prompts & sampling ----
+coco_csv: eval_prompts/coco.csv
+num_samples: 2000
+seed: 42
+eval_batch_size: 4
+
+# ---- Control maps root ----
+# Expected layout: <control_path>/<modality>/val2014/<filename>.png
+control_path: /home/woody/iwnt/iwnt134h/data/ctrl_maps
+
+# ---- Generation settings ----
+reso: 512
+guidance: 6.0
+top_k: 400
+top_p: 0.95
+
+# ---- Base model (pretrained Switti, frozen in v2) ----
+pretrained_switti: yresearch/Switti
+
+# ---- FID reference stats ----
+coco_ref_stats_path: stats/fid_stats_mscoco256_val.npz
+inception_path: stats/pt_inception-2015-12-05-6726825d.pth
+
+# ---- Runs ----
+runs:
+  - name: approach2_canny
+    modality: canny
+    num_modalities: 7
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_control_canny_zero_init/model_state_dict.pt
+
+  - name: approach2_depth
+    modality: depth
+    num_modalities: 7
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/v2.3/local_output_control_depth_zero_init/model_state_dict.pt
