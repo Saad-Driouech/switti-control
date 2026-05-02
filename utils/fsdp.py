@@ -179,7 +179,7 @@ def load_optimizer_state(args, model: torch.nn.Module, amp_optimizer) -> None:
     else:
         payload = None
 
-    full_optim_state = payload["optim"] if payload is not None else None
+    full_optim_state = payload["optim"] if payload is not None else {}
     if is_fsdp:
         sharded = FSDP.optim_state_dict_to_load(
             model=model,
