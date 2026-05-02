@@ -13,8 +13,8 @@ seed: 42
 eval_batch_size: 4
 
 # ---- Control maps root ----
-# Expected layout: <control_path>/<modality>/val2014/<filename>.png
-control_path: /home/woody/iwnt/iwnt134h/data/ctrl_maps
+# Expected layout: <control_path>/<modality>/<filename>.png
+control_path: /home/woody/iwnt/iwnt134h/switti/data/val_control
 
 # ---- Generation settings ----
 reso: 512

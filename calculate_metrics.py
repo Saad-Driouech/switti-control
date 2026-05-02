@@ -27,11 +27,11 @@ def calc_pick_or_clip_scores(model, image_inputs, text_inputs, batch_size=50):
             "attention_mask": text_inputs["attention_mask"][i : i + batch_size],
         }
         # embed
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             image_embs = model.get_image_features(image_batch)
         image_embs = image_embs / torch.norm(image_embs, dim=-1, keepdim=True)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             text_embs = model.get_text_features(**text_batch)
         text_embs = text_embs / torch.norm(text_embs, dim=-1, keepdim=True)
         # score
@@ -148,7 +148,7 @@ def distributed_metrics_with_csv(
     csv_path,
     args,
     control_path: str = None,
-    val_subset: str = "val2014",
+    val_subset: str = "",
     control_modality: str = None,
 ):
     """
