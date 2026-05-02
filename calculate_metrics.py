@@ -129,6 +129,11 @@ def calculate_scores(
         clip_model, image_inputs, text_inputs
     ).mean()
 
+    # Free CLIP + PickScore before loading ImageReward to avoid OOM on 32 GB GPUs
+    del clip_model, pickscore_model, processor, image_inputs, text_inputs
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+
     print("Evaluating ImageReward...")
     image_reward = calculate_image_reward_score(
         images,
