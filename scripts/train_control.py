@@ -258,7 +258,9 @@ def main_training():
         if cur_iter % args.save_iters == 0 and cur_iter > start_it:
             save_model_state(cur_iter, args, trainer.control_net, trainer.optimizer)
 
-            # Calculate metrics
+            # Calculate metrics — free fragmented allocations before summoning full params
+            gc.collect()
+            torch.cuda.empty_cache()
             trainer.pipe.control_net.eval()
             control_modality = getattr(args, "control_modalities", ["canny"])[0]
             for eval_set_name in ["coco", "mjhq"]:
