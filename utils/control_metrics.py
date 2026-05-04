@@ -450,6 +450,7 @@ def calculate_normal_metrics(generated_images, control_images):
     detector = _get_normal_estimator()
 
     mae_scores = []
+    rmse_scores = []
     cos_scores = []
 
     for gen_img, ctrl_img in zip(generated_images, control_images):
@@ -477,14 +478,15 @@ def calculate_normal_metrics(generated_images, control_images):
 
         # Cosine similarity per pixel, then mean
         cos_sim = np.sum(gen_unit * ctrl_unit, axis=-1).clip(-1.0, 1.0)  # [H, W]
+        angles = np.degrees(np.arccos(cos_sim))
         cos_scores.append(float(np.mean(cos_sim)))
-
-        # Angular error in degrees
-        mae_scores.append(float(np.mean(np.degrees(np.arccos(cos_sim)))))
+        mae_scores.append(float(np.mean(angles)))
+        rmse_scores.append(float(np.sqrt(np.mean(angles ** 2))))
 
     return {
-        'normal_mae_deg':    float(np.mean(mae_scores)) if mae_scores else 0.0,
-        'normal_cosine_sim': float(np.mean(cos_scores)) if cos_scores else 0.0,
+        'normal_mae_deg':    float(np.mean(mae_scores))  if mae_scores  else 0.0,
+        'normal_rmse_deg':   float(np.mean(rmse_scores)) if rmse_scores else 0.0,
+        'normal_cosine_sim': float(np.mean(cos_scores))  if cos_scores  else 0.0,
     }
 
 
