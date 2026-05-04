@@ -69,7 +69,7 @@ def main():
     extra_cols = [c for c in df.columns
                   if c not in {"name", "modality", "ckpt",
                                "control_encoder_type", "control_fusion",
-                               "num_samples"} + GENERIC_COLS]
+                               "num_samples"} | set(GENERIC_COLS)]
     cols = ["name", "modality"] + GENERIC_COLS + extra_cols
     cols = [c for c in cols if c in df.columns]
 
