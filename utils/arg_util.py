@@ -234,6 +234,7 @@ class Args(Tap):
     def configure(self) -> None:
         """Configure argument parsing for Union types."""
         self.add_argument('--control_types', type=parse_control_types)
+        self.add_argument('--control_modalities', type=parse_control_types)
 
     def seed_everything(self, benchmark: bool):
         torch.backends.cudnn.enabled = True
