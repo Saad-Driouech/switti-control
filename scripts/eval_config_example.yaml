@@ -8,7 +8,9 @@
 # ---- Evaluation set ----
 coco_csv: eval_prompts/coco.csv
 control_path: /home/woody/iwnt/iwnt134h/switti/data/val_control
+coco_images_path: /home/woody/iwnt/iwnt134h/switti/data/val2014  # optional: path to original COCO val images
 num_samples: 2000
+num_save_samples: 100  # number of sample triplets (generated + control + original) to save per run
 seed: 42
 eval_batch_size: 4   # global block = eval_batch_size * world_size; subset is truncated to a multiple
 

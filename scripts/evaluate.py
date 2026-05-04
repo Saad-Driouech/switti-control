@@ -21,6 +21,7 @@ import gc
 import json
 import os
 import re
+import shutil
 import sys
 from types import SimpleNamespace
 
@@ -161,8 +162,51 @@ def _build_pipe(run: dict, cfg: dict):
     return pipe
 
 
+def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
+                  out_dir: str) -> None:
+    """Save generated images, control maps, and original images for qualitative analysis."""
+    n = cfg.get("num_save_samples", 100)
+    modality = run.get("modality")
+    control_path = cfg.get("control_path")
+    images_path = cfg.get("coco_images_path")  # optional: path to original COCO val images
+    reso = cfg.get("reso", 512)
+
+    df = pd.read_csv(subset_csv)
+    n = min(n, len(df), len(pil_images))
+
+    save_dir = os.path.join(out_dir, "samples", run["name"])
+    os.makedirs(save_dir, exist_ok=True)
+
+    for i in range(n):
+        fname = str(df.iloc[i].get("file_name", "None"))
+        sample_dir = os.path.join(save_dir, f"{i:04d}")
+        os.makedirs(sample_dir, exist_ok=True)
+
+        # Generated image
+        pil_images[i].save(os.path.join(sample_dir, "generated.jpg"), quality=95)
+
+        # Control map — copy directly to preserve quality
+        if modality and control_path and fname != "None":
+            fname_png = fname.replace(".jpg", ".png")
+            ctrl_fp = os.path.join(control_path, modality, fname_png)
+            if os.path.exists(ctrl_fp):
+                shutil.copy(ctrl_fp, os.path.join(sample_dir, f"control_{modality}.png"))
+
+        # Original image — resize to match generated resolution
+        if images_path and fname != "None":
+            from PIL import Image as PILImage
+            orig_fp = os.path.join(images_path, fname)
+            if os.path.exists(orig_fp):
+                orig = PILImage.open(orig_fp).convert("RGB").resize(
+                    (reso, reso), PILImage.LANCZOS
+                )
+                orig.save(os.path.join(sample_dir, "original.jpg"), quality=95)
+
+    print(f"[samples] saved {n} samples -> {save_dir}")
+
+
 def _evaluate_one(run: dict, cfg: dict, subset_csv: str, num_samples: int,
-                  control_path: str | None) -> dict:
+                  control_path: str | None, out_dir: str = "") -> dict:
     """Run distributed eval for a single (modality, ckpt) entry."""
     args = _make_args(cfg, num_samples, run.get("modality"))
     pipe = _build_pipe(run, cfg)
@@ -192,6 +236,7 @@ def _evaluate_one(run: dict, cfg: dict, subset_csv: str, num_samples: int,
             pil_images, args.coco_ref_stats_path,
             inception_path=args.inception_path,
         ))
+        _save_samples(run, cfg, subset_csv, pil_images, out_dir)
 
     result = {
         "name": run["name"],
@@ -264,6 +309,7 @@ def main():
             subset_csv=subset_csv,
             num_samples=n_final,
             control_path=cfg.get("control_path"),
+            out_dir=args_cli.out_dir,
         )
 
         if dist.is_master():
