@@ -404,8 +404,8 @@ def calculate_depth_metrics(generated_images, control_images, device='cuda'):
         abs_rel = float(np.mean(np.abs(gen_norm[valid] - ctrl_norm[valid]) / ctrl_norm[valid]))
         abs_rel_scores.append(abs_rel)
 
-        # RMSE on normalized depth
-        rmse = float(np.sqrt(np.mean((gen_norm - ctrl_norm) ** 2)))
+        # RMSE on normalized depth (valid pixels only, consistent with abs_rel)
+        rmse = float(np.sqrt(np.mean((gen_norm[valid] - ctrl_norm[valid]) ** 2)))
         rmse_scores.append(rmse)
 
         # δ < 1.25 threshold accuracy
