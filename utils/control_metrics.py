@@ -288,7 +288,7 @@ def calculate_normal_metrics(generated_images, control_images) -> dict:
          'normal_cosine_sim': float (higher is better)}
     """
     detector = _get_normal_estimator()
-    mae_scores, cos_scores = [], []
+    mae_scores, rmse_scores, cos_scores = [], [], []
 
     for gen, ctrl in zip(generated_images, control_images):
         if ctrl is None:
@@ -309,12 +309,15 @@ def calculate_normal_metrics(generated_images, control_images) -> dict:
         gen_unit  = gen_n  / np.linalg.norm(gen_n,  axis=-1, keepdims=True).clip(min=1e-8)
         ctrl_unit = ctrl_n / np.linalg.norm(ctrl_n, axis=-1, keepdims=True).clip(min=1e-8)
         cos = np.clip(np.sum(gen_unit * ctrl_unit, axis=-1), -1.0, 1.0)
+        angles = np.degrees(np.arccos(cos))
         cos_scores.append(float(np.mean(cos)))
-        mae_scores.append(float(np.mean(np.degrees(np.arccos(cos)))))
+        mae_scores.append(float(np.mean(angles)))
+        rmse_scores.append(float(np.sqrt(np.mean(angles ** 2))))
 
     return {
-        "normal_mae_deg":    float(np.mean(mae_scores)) if mae_scores else 0.0,
-        "normal_cosine_sim": float(np.mean(cos_scores)) if cos_scores else 0.0,
+        "normal_mae_deg":    float(np.mean(mae_scores))  if mae_scores  else 0.0,
+        "normal_rmse_deg":   float(np.mean(rmse_scores)) if rmse_scores else 0.0,
+        "normal_cosine_sim": float(np.mean(cos_scores))  if cos_scores  else 0.0,
     }
 
 
