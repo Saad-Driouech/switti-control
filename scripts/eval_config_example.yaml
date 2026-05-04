@@ -15,6 +15,8 @@ eval_batch_size: 4
 # ---- Control maps root ----
 # Expected layout: <control_path>/<modality>/<filename>.png
 control_path: /home/woody/iwnt/iwnt134h/switti/data/val_control
+coco_images_path: /home/woody/iwnt/iwnt134h/switti/data/val2014  # optional: path to original COCO val images
+num_save_samples: 100  # number of sample triplets (generated + control + original) to save per run
 
 # ---- Generation settings ----
 reso: 512
