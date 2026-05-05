@@ -344,15 +344,22 @@ def calculate_depth_metrics(generated_images, control_images, device='cuda'):
     Mirrors the preprocessing pipeline exactly: the same ZoeDepth (zoedepth_nk) model
     used to produce the control depth maps is run on the generated image.
 
-    Follows the scale-invariant depth evaluation protocol from Eigen et al. 2014,
-    adapted for normalized depth (both maps normalized to [0,1] before comparison
-    since no absolute metric scale is available at evaluation time).
+    Both maps are normalized to [0,1] independently (min-max) before comparison,
+    since no absolute metric scale is available at evaluation time.
+
+    AbsRel is intentionally omitted: after min-max normalization the minimum depth
+    value maps to exactly 0, so the denominator of AbsRel becomes near-zero for
+    many pixels and the metric diverges to pathologically large values. RMSE and δ₁
+    are well-behaved under this normalization and are the reported metrics.
+
+    Pixels where the normalized control depth is below 0.05 (i.e., within 5% of the
+    minimum value) are excluded from both metrics, as they correspond to nearly-zero
+    denominators that would corrupt δ₁ as well.
 
     Metrics:
-        'depth_abs_rel': Mean absolute relative error (lower is better)
-        'depth_rmse':    RMSE on normalized depth (lower is better)
-        'depth_delta1':  Fraction of pixels where max(pred/gt, gt/pred) < 1.25
-                         (higher is better; standard δ₁ accuracy)
+        'depth_rmse':   RMSE on normalized depth in [0,1] (lower is better)
+        'depth_delta1': Fraction of pixels where max(pred/gt, gt/pred) < 1.25
+                        (higher is better; standard δ₁ accuracy)
 
     Args:
         generated_images: List of PIL Images (RGB, 512×512, uint8 [0,255])
@@ -360,13 +367,12 @@ def calculate_depth_metrics(generated_images, control_images, device='cuda'):
         device:           torch device for ZoeDepth inference
 
     Returns:
-        dict: {'depth_abs_rel': float, 'depth_rmse': float, 'depth_delta1': float}
+        dict: {'depth_rmse': float, 'depth_delta1': float}
     """
     from zoedepth.utils.misc import pil_to_batched_tensor
 
     zoe = _get_depth_estimator(device)
 
-    abs_rel_scores = []
     rmse_scores = []
     delta1_scores = []
 
@@ -394,31 +400,24 @@ def calculate_depth_metrics(generated_images, control_images, device='cuda'):
         gen_norm = (gen_depth - gen_depth.min()) / (gen_depth.max() - gen_depth.min() + 1e-8)
         ctrl_norm = (ctrl_depth - ctrl_depth.min()) / (ctrl_depth.max() - ctrl_depth.min() + 1e-8)
 
-        # Only evaluate over pixels where control depth is non-trivial
-        eps = 1e-8
-        valid = ctrl_norm > eps
+        # Exclude pixels near the minimum depth value — their near-zero
+        # denominators corrupt δ₁ ratios.
+        valid = ctrl_norm > 0.05
         if not valid.any():
             continue
 
-        # AbsRel: mean(|pred - gt| / gt) — standard Eigen et al. metric
-        abs_rel = float(np.mean(np.abs(gen_norm[valid] - ctrl_norm[valid]) / ctrl_norm[valid]))
-        abs_rel_scores.append(abs_rel)
+        rmse_scores.append(float(np.sqrt(np.mean((gen_norm[valid] - ctrl_norm[valid]) ** 2))))
 
-        # RMSE on normalized depth (valid pixels only, consistent with abs_rel)
-        rmse = float(np.sqrt(np.mean((gen_norm[valid] - ctrl_norm[valid]) ** 2)))
-        rmse_scores.append(rmse)
-
-        # δ < 1.25 threshold accuracy
+        eps = 1e-8
         ratio = np.maximum(
             gen_norm[valid] / (ctrl_norm[valid] + eps),
-            ctrl_norm[valid] / (gen_norm[valid] + eps),
+            ctrl_norm[valid] / (gen_norm[valid]  + eps),
         )
         delta1_scores.append(float(np.mean(ratio < 1.25)))
 
     return {
-        'depth_abs_rel': float(np.mean(abs_rel_scores)) if abs_rel_scores else 0.0,
-        'depth_rmse':    float(np.mean(rmse_scores))    if rmse_scores    else 0.0,
-        'depth_delta1':  float(np.mean(delta1_scores))  if delta1_scores  else 0.0,
+        'depth_rmse':   float(np.mean(rmse_scores))   if rmse_scores   else 0.0,
+        'depth_delta1': float(np.mean(delta1_scores)) if delta1_scores else 0.0,
     }
 
 
@@ -772,7 +771,7 @@ def calculate_control_metrics(generated_images, control_dict, control_type, devi
             metrics['edge_recall']    = edge_f1_results['recall']
 
         elif control_type == 'depth':
-            # AbsRel, RMSE, δ<1.25 on ZoeDepth-estimated depth (Eigen et al. 2014 protocol)
+            # RMSE and δ<1.25 on normalized ZoeDepth-estimated depth maps
             metrics.update(calculate_depth_metrics(valid_gen, valid_ctrl, device=device))
 
         elif control_type == 'normals':
