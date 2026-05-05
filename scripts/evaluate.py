@@ -83,10 +83,16 @@ def _build_subset_csv(full_csv: str, n: int, seed: int, eval_batch_size: int,
     return final_n
 
 
-def _make_args(cfg: dict, num_samples: int, modality: str | None) -> SimpleNamespace:
-    """Build the args object that `distributed_metrics_with_csv` reads."""
+def _make_args(cfg: dict, num_samples: int, modality: str | None,
+               guidance: float | None = None) -> SimpleNamespace:
+    """Build the args object that `distributed_metrics_with_csv` reads.
+
+    `guidance` overrides cfg["guidance"] when provided (used for CFG sweeps).
+    """
     reso = cfg.get("reso", 512)
     patch_nums = tuple(int(x) for x in RESOLUTION_PATCH_NUMS_MAPPING[reso].split("_"))
+    if guidance is None:
+        guidance = cfg.get("guidance", 6.0)
     return SimpleNamespace(
         metrics_max_count=num_samples,
         eval_batch_size=cfg.get("eval_batch_size", 4),
@@ -95,7 +101,7 @@ def _make_args(cfg: dict, num_samples: int, modality: str | None) -> SimpleNames
         mid_reso=cfg.get("mid_reso", 1.125),
         num_images_for_metrics=1,
         seed=cfg.get("seed", 42),
-        guidance=cfg.get("guidance", 6.0),
+        guidance=guidance,
         top_k=cfg.get("top_k", 400),
         top_p=cfg.get("top_p", 0.95),
         control_end_si=cfg.get("control_end_si", 8),
@@ -163,7 +169,7 @@ def _build_pipe(run: dict, cfg: dict):
 
 
 def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
-                  out_dir: str) -> None:
+                  out_dir: str, save_name: str | None = None) -> None:
     """Save generated images, control maps, and original images for qualitative analysis."""
     n = cfg.get("num_save_samples", 100)
     modality = run.get("modality")
@@ -174,7 +180,7 @@ def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
     df = pd.read_csv(subset_csv)
     n = min(n, len(df), len(pil_images))
 
-    save_dir = os.path.join(out_dir, "samples", run["name"])
+    save_dir = os.path.join(out_dir, "samples", save_name or run["name"])
     os.makedirs(save_dir, exist_ok=True)
 
     for i in range(n):
@@ -205,11 +211,12 @@ def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
     print(f"[samples] saved {n} samples -> {save_dir}")
 
 
-def _evaluate_one(run: dict, cfg: dict, subset_csv: str, num_samples: int,
-                  control_path: str | None, out_dir: str = "") -> dict:
-    """Run distributed eval for a single (modality, ckpt) entry."""
-    args = _make_args(cfg, num_samples, run.get("modality"))
-    pipe = _build_pipe(run, cfg)
+def _evaluate_with_pipe(pipe, run: dict, cfg: dict, subset_csv: str,
+                        num_samples: int, control_path: str | None,
+                        out_dir: str, guidance: float,
+                        result_name: str) -> dict:
+    """Run distributed eval for one (run, guidance) combination using a pre-built pipe."""
+    args = _make_args(cfg, num_samples, run.get("modality"), guidance=guidance)
 
     local_images, l_pick, l_clip, l_ir, l_ctrl = distributed_metrics_with_csv(
         pipe, subset_csv, control_path, args
@@ -236,11 +243,14 @@ def _evaluate_one(run: dict, cfg: dict, subset_csv: str, num_samples: int,
             pil_images, args.coco_ref_stats_path,
             inception_path=args.inception_path,
         ))
-        _save_samples(run, cfg, subset_csv, pil_images, out_dir)
+        _save_samples(run, cfg, subset_csv, pil_images, out_dir,
+                      save_name=result_name)
 
     result = {
-        "name": run["name"],
+        "name": result_name,
+        "run": run["name"],
         "modality": run.get("modality"),
+        "cfg": guidance,
         "ckpt": run.get("ckpt"),
         "control_encoder_type": run.get("control_encoder_type"),
         "control_fusion": run.get("control_fusion"),
@@ -252,7 +262,7 @@ def _evaluate_one(run: dict, cfg: dict, subset_csv: str, num_samples: int,
     }
     result.update(ctrl)
 
-    del pipe, local_images, gathered
+    del local_images, gathered
     gc.collect()
     torch.cuda.empty_cache()
     return result
@@ -297,26 +307,52 @@ def main():
     if dist.is_master() and os.path.exists(results_path):
         print(f"[warn] {results_path} exists — appending")
 
+    # cfg_sweep: list of guidance values to evaluate for every run.
+    # Falls back to a single-element list using the global guidance value,
+    # which preserves backwards-compatible behaviour.
+    cfg_values = cfg.get("cfg_sweep") or [cfg.get("guidance", 6.0)]
+
     for run in cfg["runs"]:
         if dist.is_master():
             print(f"\n=========================================")
-            print(f"=== EVAL: {run['name']}  (modality={run.get('modality')})")
+            print(f"=== RUN: {run['name']}  (modality={run.get('modality')})")
+            print(f"=== CFG sweep: {cfg_values}")
             print(f"=========================================")
 
-        result = _evaluate_one(
-            run=run,
-            cfg=cfg,
-            subset_csv=subset_csv,
-            num_samples=n_final,
-            control_path=cfg.get("control_path"),
-            out_dir=args_cli.out_dir,
-        )
+        pipe = _build_pipe(run, cfg)
 
-        if dist.is_master():
-            print(f"[result] {json.dumps(result, indent=2)}")
-            with open(results_path, "a") as f:
-                f.write(json.dumps(result) + "\n")
-        _safe_barrier()
+        for guidance in cfg_values:
+            # When there is only one CFG value, keep the name identical to the
+            # run name so existing result files remain compatible.
+            if len(cfg_values) == 1:
+                result_name = run["name"]
+            else:
+                result_name = f"{run['name']}_cfg{guidance:g}"
+
+            if dist.is_master():
+                print(f"\n--- guidance={guidance}  name={result_name}")
+
+            result = _evaluate_with_pipe(
+                pipe=pipe,
+                run=run,
+                cfg=cfg,
+                subset_csv=subset_csv,
+                num_samples=n_final,
+                control_path=cfg.get("control_path"),
+                out_dir=args_cli.out_dir,
+                guidance=guidance,
+                result_name=result_name,
+            )
+
+            if dist.is_master():
+                print(f"[result] {json.dumps(result, indent=2)}")
+                with open(results_path, "a") as f:
+                    f.write(json.dumps(result) + "\n")
+            _safe_barrier()
+
+        del pipe
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if dist.is_master():
         rows = []

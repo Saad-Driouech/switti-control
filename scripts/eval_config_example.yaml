@@ -17,7 +17,10 @@ eval_batch_size: 4   # global block = eval_batch_size * world_size; subset is tr
 # ---- Generation ----
 reso: 512
 depth: 30
-guidance: 6.0
+guidance: 6.0          # default / single-run CFG value
+# cfg_sweep: [3.0, 4.5, 6.0, 7.5, 9.0]   # uncomment to sweep multiple CFG values;
+                                            # each run is evaluated once per value,
+                                            # the model is loaded only once per run.
 top_k: 400
 top_p: 0.95
 control_end_si: 8
