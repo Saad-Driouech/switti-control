@@ -174,16 +174,20 @@ def calculate_depth_metrics(generated_images, control_images, device="cuda") -> 
     Follows the scale-invariant evaluation protocol from Eigen et al. 2014, adapted for
     normalized depth (both maps normalized to [0,1] independently).
 
+    Both maps are independently min-max normalized to [0, 1] before comparison
+    (scale-invariant). AbsRel is omitted: after min-max normalization the
+    denominator is an arbitrary shifted value, not a physically grounded scale,
+    causing near-zero entries to inflate the metric pathologically.
+
     Returns:
-        {'depth_abs_rel': float (lower is better),
-         'depth_rmse':    float (lower is better),
-         'depth_delta1':  float (higher is better; δ < 1.25 threshold accuracy)}
+        {'depth_rmse':   float (normalized RMSE on [0,1] maps; lower is better),
+         'depth_delta1': float (δ < 1.25 threshold accuracy; higher is better)}
     """
     import cv2
     from zoedepth.utils.misc import pil_to_batched_tensor
 
     zoe = _get_depth_estimator(device)
-    abs_rel_scores, rmse_scores, delta1_scores = [], [], []
+    rmse_scores, delta1_scores = [], []
 
     for gen, ctrl in zip(generated_images, control_images):
         if ctrl is None:
@@ -206,21 +210,24 @@ def calculate_depth_metrics(generated_images, control_images, device="cuda") -> 
         gen_norm  = (gen_depth  - gen_depth.min())  / (gen_depth.max()  - gen_depth.min()  + 1e-8)
         ctrl_norm = (ctrl_depth - ctrl_depth.min()) / (ctrl_depth.max() - ctrl_depth.min() + 1e-8)
 
-        eps = 1e-8
-        valid = ctrl_norm > eps
+        # Exclude pixels too close to the normalized minimum.
+        # AbsRel requires a physically grounded denominator (meters); after
+        # min-max normalization the denominator is an arbitrary shifted value,
+        # so near-zero ctrl_norm entries inflate AbsRel pathologically.
+        # We therefore report only normalized RMSE and δ₁.
+        valid = ctrl_norm > 0.05
         if not valid.any():
             continue
 
-        abs_rel_scores.append(float(np.mean(np.abs(gen_norm[valid] - ctrl_norm[valid]) / ctrl_norm[valid])))
         rmse_scores.append(float(np.sqrt(np.mean((gen_norm[valid] - ctrl_norm[valid]) ** 2))))
+        eps = 1e-8
         ratio = np.maximum(gen_norm[valid] / (ctrl_norm[valid] + eps),
                            ctrl_norm[valid] / (gen_norm[valid]  + eps))
         delta1_scores.append(float(np.mean(ratio < 1.25)))
 
     return {
-        "depth_abs_rel": float(np.mean(abs_rel_scores)) if abs_rel_scores else 0.0,
-        "depth_rmse":    float(np.mean(rmse_scores))    if rmse_scores    else 0.0,
-        "depth_delta1":  float(np.mean(delta1_scores))  if delta1_scores  else 0.0,
+        "depth_rmse":   float(np.mean(rmse_scores))   if rmse_scores   else 0.0,
+        "depth_delta1": float(np.mean(delta1_scores)) if delta1_scores else 0.0,
     }
 
 
