@@ -308,7 +308,12 @@ class SwittiControlPipeline(SwittiPipeline):
                     logits_BlV = logits_BlV[:B]
                 elif si >= turn_on_cfg_start_si and si < turn_off_cfg_start_si:
                     t = cfg * ratio
-                    logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+                    # Upcast to float32: fp16 logits can overflow (max 65504),
+                    # and 0 * Inf = NaN when t=0 at si=0.
+                    orig_dtype = logits_BlV.dtype
+                    cond_f32 = logits_BlV[:B].float()
+                    uncond_f32 = logits_BlV[B:].float()
+                    logits_BlV = ((1 + t) * cond_f32 - t * uncond_f32).to(orig_dtype)
                 elif last_scale_temp is not None:
                     logits_BlV = logits_BlV / last_scale_temp
 
