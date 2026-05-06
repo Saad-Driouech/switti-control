@@ -155,6 +155,7 @@ def distributed_metrics_with_csv(
     control_path: str = None,
     val_subset: str = "",
     control_modality: str = None,
+    preview_save_dir: str = None,
 ):
     """
     Args:
@@ -237,6 +238,14 @@ def distributed_metrics_with_csv(
 
         local_images.extend(image_tensors)
         local_prompts.extend(texts)
+
+        if preview_save_dir is not None and dist.is_master():
+            os.makedirs(preview_save_dir, exist_ok=True)
+            offset = len(local_images) - len(image_tensors)
+            for j, t in enumerate(image_tensors):
+                to_PIL_image(t).save(
+                    os.path.join(preview_save_dir, f"{offset + j:04d}.jpg"), quality=90
+                )
 
     local_images = torch.stack(local_images).cuda()
     pil_images = [to_PIL_image(image) for image in local_images.clone()]

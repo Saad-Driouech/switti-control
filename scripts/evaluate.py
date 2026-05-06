@@ -162,12 +162,14 @@ def _evaluate_with_pipe(pipe, run: dict, cfg: dict, subset_csv: str,
     """Run eval for one (run, guidance) combination using a pre-built pipe."""
     args = _make_args(cfg, num_samples, guidance=guidance)
 
+    preview_dir = os.path.join(out_dir, "samples", result_name)
     local_images, l_pick, l_clip, l_ir, l_ctrl = distributed_metrics_with_csv(
         pipe,
         subset_csv,
         args,
         control_path=control_path,
         control_modality=run.get("modality"),
+        preview_save_dir=preview_dir,
     )
 
     ws = dist.get_world_size()
