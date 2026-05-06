@@ -103,7 +103,7 @@ def _build_pipe(run: dict, cfg: dict) -> SwittiControlPipeline:
     pipe = SwittiControlPipeline.from_pretrained(
         pretrained_model_name_or_path=cfg.get("pretrained_switti", "yresearch/Switti"),
         control_ckpt=run.get("ckpt"),
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device=device,
         reso=reso,
         num_modalities=run.get("num_modalities", 7),

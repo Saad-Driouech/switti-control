@@ -304,17 +304,13 @@ class SwittiControlPipeline(SwittiPipeline):
                 logits_BlV = switti.get_logits(x_frozen, cond_BD)
 
                 # Classifier-free guidance
-                # Keep logits in float32 for all sampling paths: fp16 softmax
-                # overflows to Inf for large logit values, producing NaN.
                 if si < turn_on_cfg_start_si:
-                    logits_BlV = logits_BlV[:B].float()
+                    logits_BlV = logits_BlV[:B]
                 elif si >= turn_on_cfg_start_si and si < turn_off_cfg_start_si:
                     t = cfg * ratio
-                    logits_BlV = (1 + t) * logits_BlV[:B].float() - t * logits_BlV[B:].float()
+                    logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
                 elif last_scale_temp is not None:
-                    logits_BlV = logits_BlV.float() / last_scale_temp
-                else:
-                    logits_BlV = logits_BlV.float()
+                    logits_BlV = logits_BlV / last_scale_temp
 
                 if apply_smooth and si >= smooth_start_si:
                     gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
