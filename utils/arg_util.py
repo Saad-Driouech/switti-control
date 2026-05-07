@@ -150,6 +150,7 @@ class Args(Tap):
     pretrained_switti: str = "yresearch/Switti"   # HuggingFace model ID for frozen Switti
     control_modalities: list = None               # e.g. ["canny"] or ["canny","depth"]
     ctrl_maps_dir: str = None                     # pre-computed control map directory
+    subset_name: str = "train2014"                # dataset sub-directory name (e.g. "train2017")
     ctrl_strength: float = 1.0                    # inference-time control strength multiplier
     control_ckpt: str = None                      # path to trained control weights
     num_modalities: int = 7                       # number of spatial modalities

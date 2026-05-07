@@ -183,6 +183,7 @@ def build_everything(args: arg_util.Args):
         modalities=modalities,
         ctrl_maps_dir=ctrl_maps_dir,
         mid_reso_factor=args.mid_reso,
+        subset_name=getattr(args, "subset_name", "train2014"),
     )
     ld_train = DataLoader(
         dataset=dataset_train,

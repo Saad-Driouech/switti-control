@@ -24,7 +24,8 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-MODALITY_IDS = {"canny": 0, "depth": 1, "seg": 2, "normals": 3, "hed": 4, "gray": 5, "openpose": 6}
+MODALITY_IDS = {"canny": 0, "depth": 1, "seg": 2, "normals": 3, "hed": 4, "gray": 5, "openpose": 6,
+                "seg_cocostuff": 2}  # same embedding slot as seg
 
 
 def _build_transform(final_reso: int, mid_reso_factor: float = 1.125):
@@ -175,10 +176,11 @@ def build_control_dataset(
     ctrl_maps_dir: Optional[str] = None,
     mid_reso_factor: float = 1.125,
     max_cnt: Optional[int] = None,
+    subset_name: str = "train2014",
 ) -> SpatialControlDataset:
     ds = SpatialControlDataset(
         root_dir=data_path,
-        subset_name="train2014",
+        subset_name=subset_name,
         modalities=modalities or ["canny"],
         ctrl_maps_dir=ctrl_maps_dir,
         final_reso=final_reso,
