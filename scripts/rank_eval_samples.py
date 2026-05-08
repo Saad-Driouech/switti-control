@@ -38,6 +38,19 @@ if PROJECT_ROOT not in sys.path:
 
 
 # ---------------------------------------------------------------------------
+# Control image preprocessing (must match training transform)
+# ---------------------------------------------------------------------------
+
+def _preprocess_ctrl(ctrl: Image.Image, final_reso: int = 512,
+                     mid_reso_factor: float = 1.125) -> Image.Image:
+    """Resize(mid_reso, NEAREST) + CenterCrop(final_reso) — matches training."""
+    mid_reso = round(mid_reso_factor * final_reso)  # 576
+    ctrl = ctrl.resize((mid_reso, mid_reso), Image.NEAREST)
+    left = (mid_reso - final_reso) // 2
+    return ctrl.crop((left, left, left + final_reso, left + final_reso))
+
+
+# ---------------------------------------------------------------------------
 # Modality detection
 # ---------------------------------------------------------------------------
 
@@ -135,7 +148,7 @@ def compute_edge_f1(gen: Image.Image, ctrl: Image.Image,
 
 def compute_ssim(gen: Image.Image, ctrl: Image.Image) -> float:
     from skimage.metrics import structural_similarity as ssim
-    g = _pil_to_gray_np(gen.resize(ctrl.size, Image.LANCZOS))
+    g = _pil_to_gray_np(gen)
     c = _pil_to_gray_np(ctrl)
     return float(ssim(g, c, data_range=1.0))
 
@@ -150,7 +163,7 @@ def compute_depth_rmse(gen: Image.Image, ctrl: Image.Image, device: str) -> floa
         pred = model.infer(gen_t).squeeze().cpu().numpy()
     pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
 
-    ctrl_np = _pil_to_gray_np(ctrl.resize(gen.size, Image.NEAREST))
+    ctrl_np = _pil_to_gray_np(ctrl)
     ctrl_np = (ctrl_np - ctrl_np.min()) / (ctrl_np.max() - ctrl_np.min() + 1e-8)
 
     valid = ctrl_np > 0.05
@@ -167,7 +180,7 @@ def compute_normal_rmse(gen: Image.Image, ctrl: Image.Image) -> float:
     from utils.control_metrics import _get_normal_estimator
     detector = _get_normal_estimator()
     gen_normal = detector(gen)
-    g = _pil_to_np(gen_normal.resize(ctrl.size, Image.NEAREST))
+    g = _pil_to_np(gen_normal)
     c = _pil_to_np(ctrl)
     g = g * 2 - 1
     c = c * 2 - 1
@@ -189,7 +202,7 @@ def compute_seg_iou(gen: Image.Image, ctrl: Image.Image, device: str) -> float:
         if mask.squeeze().float().mean() > 0.5:
             gen_mask |= mask.squeeze().bool().cpu()
 
-    ctrl_gray = _pil_to_gray_np(ctrl.resize(gen.size, Image.NEAREST))
+    ctrl_gray = _pil_to_gray_np(ctrl)
     ctrl_mask = ctrl_gray > 0.1
 
     inter = (gen_mask.numpy() & ctrl_mask).sum()
@@ -250,7 +263,9 @@ def rank_run(run_dir: Path, subset_df: pd.DataFrame, modality: str,
 
         images.append(Image.open(gen_fp).convert("RGB"))
         prompts.append(prompt)
-        ctrl_maps.append(Image.open(ctrl_fp).convert("RGB") if ctrl_fp else None)
+        ctrl_maps.append(
+            _preprocess_ctrl(Image.open(ctrl_fp).convert("RGB")) if ctrl_fp else None
+        )
         indices.append(idx)
 
     if not images:

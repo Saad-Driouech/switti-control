@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 from transformers import AutoModel, AutoProcessor
 
 from PIL import Image
@@ -173,8 +174,10 @@ def distributed_metrics_with_csv(
     rank_caption_batches, rank_filename_batches = prepare_prompts(csv_path, args.eval_batch_size, max_count)
     assert max_count % (args.eval_batch_size * dist.get_world_size()) == 0
 
+    mid_reso = round(1.125 * args.data_load_reso)
     ctrl_transform = transforms.Compose([
-        transforms.Resize((args.data_load_reso, args.data_load_reso)),
+        transforms.Resize(mid_reso, interpolation=InterpolationMode.NEAREST),
+        transforms.CenterCrop(args.data_load_reso),
         transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ]) if control_path is not None else None

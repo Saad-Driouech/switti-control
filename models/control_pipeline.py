@@ -108,13 +108,17 @@ class SwittiControlPipeline(SwittiPipeline):
                 b.cross_attn.kv_caching(False)
 
     @staticmethod
-    def _preprocess_ctrl_image(ctrl_image, device, dtype, size=512):
+    def _preprocess_ctrl_image(ctrl_image, device, dtype, size=512,
+                               mid_reso_factor=1.125):
         """Convert a PIL image or (B,3,H,W) tensor to a normalised tensor."""
         if isinstance(ctrl_image, Image.Image):
             ctrl_image = [ctrl_image]
         if isinstance(ctrl_image, (list, tuple)) and isinstance(ctrl_image[0], Image.Image):
+            from torchvision.transforms import InterpolationMode
+            mid_reso = round(mid_reso_factor * size)
             to_tensor = transforms.Compose([
-                transforms.Resize((size, size)),
+                transforms.Resize(mid_reso, interpolation=InterpolationMode.NEAREST),
+                transforms.CenterCrop(size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ])
