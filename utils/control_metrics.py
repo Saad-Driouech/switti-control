@@ -124,6 +124,23 @@ _seg_model = None
 _seg_model_device = None
 
 
+def free_control_metric_models():
+    """Release all cached control-metric models from GPU memory."""
+    import gc
+    import torch
+    global _hed_detector, _depth_estimator, _depth_estimator_device
+    global _normal_estimator, _openpose_detector, _seg_model, _seg_model_device
+    _hed_detector = None
+    _depth_estimator = None
+    _depth_estimator_device = None
+    _normal_estimator = None
+    _openpose_detector = None
+    _seg_model = None
+    _seg_model_device = None
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _get_hed_detector():
     global _hed_detector
     if _hed_detector is None:

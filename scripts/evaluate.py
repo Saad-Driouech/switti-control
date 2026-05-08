@@ -35,6 +35,7 @@ if PROJECT_ROOT not in sys.path:
 import dist
 from calculate_metrics import distributed_metrics_with_csv, to_PIL_image
 from models.control_pipeline import SwittiControlPipeline
+from utils.control_metrics import free_control_metric_models
 from utils.fid_score_in_memory import calculate_fid
 
 
@@ -290,6 +291,7 @@ def main():
                 guidance=guidance,
                 result_name=result_name,
             )
+            free_control_metric_models()
 
             if dist.is_master():
                 print(f"[result] {json.dumps(result, indent=2)}")
