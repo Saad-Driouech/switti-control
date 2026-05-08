@@ -136,6 +136,11 @@ def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
         # Generated image
         pil_images[i].save(os.path.join(sample_dir, "generated.jpg"), quality=95)
 
+        # Prompt
+        caption = str(df.iloc[i].get("captions", ""))
+        with open(os.path.join(sample_dir, "prompt.txt"), "w") as f:
+            f.write(caption)
+
         # Control map — copy directly to preserve quality
         if modality and control_path and fname != "None":
             fname_png = fname.replace(".jpg", ".png")
