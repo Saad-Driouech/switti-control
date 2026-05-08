@@ -141,12 +141,18 @@ def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
         with open(os.path.join(sample_dir, "prompt.txt"), "w") as f:
             f.write(caption)
 
-        # Control map — copy directly to preserve quality
+        # Control map — save the processed version (matches what the model saw)
         if modality and control_path and fname != "None":
             fname_png = fname.replace(".jpg", ".png")
             ctrl_fp = os.path.join(control_path, modality, fname_png)
             if os.path.exists(ctrl_fp):
-                shutil.copy(ctrl_fp, os.path.join(sample_dir, f"control_{modality}.png"))
+                from PIL import Image as PILImage
+                mid_reso = round(1.125 * reso)
+                ctrl = PILImage.open(ctrl_fp).convert("RGB")
+                ctrl = ctrl.resize((mid_reso, mid_reso), PILImage.NEAREST)
+                left = (mid_reso - reso) // 2
+                ctrl = ctrl.crop((left, left, left + reso, left + reso))
+                ctrl.save(os.path.join(sample_dir, f"control_{modality}.png"))
 
         # Original image — resize to match generated resolution
         if images_path and fname != "None":
