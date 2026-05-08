@@ -191,12 +191,23 @@ def _save_samples(run: dict, cfg: dict, subset_csv: str, pil_images: list,
         # Generated image
         pil_images[i].save(os.path.join(sample_dir, "generated.jpg"), quality=95)
 
-        # Control map — copy directly to preserve quality
+        # Control map — save the processed version (matches what the model saw)
         if modality and control_path and fname != "None":
             fname_png = fname.replace(".jpg", ".png")
             ctrl_fp = os.path.join(control_path, modality, fname_png)
             if os.path.exists(ctrl_fp):
-                shutil.copy(ctrl_fp, os.path.join(sample_dir, f"control_{modality}.png"))
+                from utils.data import JointTransform
+                from PIL import Image as PILImage
+                t = JointTransform(final_reso=reso, mid_reso=cfg.get("mid_reso", 1.125),
+                                   hflip_prob=0.0)
+                img = PILImage.open(ctrl_fp).convert("RGB")
+                _, processed = t(img, {modality: img})
+                ctrl_tensor = processed[modality]
+                ctrl_pil = PILImage.fromarray(
+                    (((ctrl_tensor + 1) / 2).clamp(0, 1)
+                     .permute(1, 2, 0).numpy() * 255).astype("uint8")
+                )
+                ctrl_pil.save(os.path.join(sample_dir, f"control_{modality}.png"))
 
         # Original image — resize to match generated resolution
         if images_path and fname != "None":
