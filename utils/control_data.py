@@ -101,15 +101,18 @@ class SpatialControlDataset(Dataset):
         if max_cnt is not None:
             self.samples = self.samples[:max_cnt]
 
-        # Load captions
+        # Load captions — supports both 2-col (file_name, caption[s]) and
+        # 3-col (index, file_name, caption) formats.
         self.captions = {}
         csv_path = os.path.join(root_dir, f"{subset_name}.csv")
         with open(csv_path, newline="\n") as f:
-            reader = csv.reader(f, delimiter=",")
-            for i, row in enumerate(reader):
-                if i == 0:
-                    continue
-                self.captions[row[1]] = row[2]
+            reader = csv.DictReader(f, delimiter=",")
+            fname_key = "file_name"
+            cap_key = None
+            for row in reader:
+                if cap_key is None:
+                    cap_key = "captions" if "captions" in row else "caption"
+                self.captions[row[fname_key]] = row[cap_key]
 
         self.img_transform = _build_transform(final_reso, mid_reso_factor)
         # Control map transform: resize + crop only (no colour normalisation)
