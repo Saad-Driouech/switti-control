@@ -351,10 +351,16 @@ def main():
     # Optional: path to existing cfg6 eval dir for copying ctrl.png
     ap.add_argument("--existing_eval_dir", default=None,
                     help="Path to existing eval_v100 out_dir to copy ctrl.png from")
+    ap.add_argument("--subset_csv", default=None,
+                    help="Path to subset.csv from the eval run. If provided, sample indices "
+                         "refer to rows in this file instead of the full coco_csv.")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.subset_csv:
+        cfg["coco_csv"] = args.subset_csv
 
     out_dir = Path(args.out_dir) / args.mode
     out_dir.mkdir(parents=True, exist_ok=True)
