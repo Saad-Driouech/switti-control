@@ -264,18 +264,20 @@ def main_training():
             torch.cuda.empty_cache()
             trainer.pipe.control_net.eval()
             control_modality = getattr(args, "control_modalities", ["canny"])[0]
-            for eval_set_name in ["coco", "mjhq"]:
+            coco_eval_name = getattr(args, "eval_csv_name", "coco")
+            eval_subset = getattr(args, "eval_subset", "val2014")
+            for eval_set_name in [coco_eval_name, "mjhq"]:
                 eval_prompts_path = f"eval_prompts/{eval_set_name}.csv"
                 fid_stats_path = (
                     args.coco_ref_stats_path
-                    if eval_set_name == "coco"
+                    if eval_set_name == coco_eval_name
                     else args.mjhq_ref_stats_path
                 )
                 # COCO: i2i evaluation with control images
                 # MJHQ: T2I evaluation (control_path=None → ctrl_strength=0)
                 eval_control_path = (
                     getattr(args, "ctrl_maps_dir", None)
-                    if eval_set_name == "coco"
+                    if eval_set_name == coco_eval_name
                     else None
                 )
 
@@ -286,7 +288,7 @@ def main_training():
                             eval_prompts_path,
                             args,
                             control_path=eval_control_path,
-                            val_subset="val2014",
+                            val_subset=eval_subset if eval_set_name == coco_eval_name else "",
                             control_modality=control_modality if eval_control_path else None,
                         )
                     )

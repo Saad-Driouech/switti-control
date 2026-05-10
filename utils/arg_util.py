@@ -151,6 +151,8 @@ class Args(Tap):
     control_modalities: list = None               # e.g. ["canny"] or ["canny","depth"]
     ctrl_maps_dir: str = None                     # pre-computed control map directory
     subset_name: str = "train2014"                # dataset sub-directory name (e.g. "train2017")
+    eval_subset: str = "val2014"                  # ctrl-map sub-directory used during evaluation
+    eval_csv_name: str = "coco"                   # stem of eval_prompts/<name>.csv for COCO eval
     ctrl_strength: float = 1.0                    # inference-time control strength multiplier
     control_ckpt: str = None                      # path to trained control weights
     num_modalities: int = 7                       # number of spatial modalities
