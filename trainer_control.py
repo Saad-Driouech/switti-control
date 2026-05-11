@@ -52,44 +52,55 @@ EVAL_PROMPTS = [
 
 
 def generate_logging_prompts_captions(
-    missing_files_path: str,
-    captions_json_path: str,
     ctrl_maps_dir: Optional[str],
     control_modalities: Optional[List[str]],
     num_select: int = 12,
     final_reso: int = 512,
     val_subset_name: str = "val2014",
+    # JSON source (val2014-style): requires both arguments
+    captions_json_path: Optional[str] = None,
+    missing_files_path: Optional[str] = None,
+    # CSV source (val2017-style): file_name + captions columns
+    captions_csv_path: Optional[str] = None,
 ) -> Tuple[List[str], Optional[dict]]:
     """
     Select eval samples for TensorBoard logging.
+
+    Accepts two caption sources (exactly one must be provided):
+      - JSON + log_files (val2014): captions_json_path + missing_files_path
+      - CSV (val2017+): captions_csv_path with file_name and captions columns
 
     Returns:
         selected_captions: list of caption strings
         ctrl_dict: {modality: (N,3,H,W) tensor in [-1,1]} or None
     """
-    # Load list of filenames to use for logging
-    with open(missing_files_path, "r") as f:
-        missing_filenames = [line.strip() for line in f if line.strip()]
-
-    # Load COCO captions
-    with open(captions_json_path, "r") as f:
-        captions_data = json.load(f)
-
-    file_to_id = {img["file_name"]: img["id"] for img in captions_data["images"]}
-    id_to_captions: dict = defaultdict(list)
-    for ann in captions_data["annotations"]:
-        id_to_captions[ann["image_id"]].append(ann["caption"])
-
-    filtered_items = []
-    for fname in missing_filenames:
-        image_id = file_to_id.get(fname)
-        fname_png = fname.replace(".jpg", ".png")
-        if image_id is None:
-            continue
-        caps = id_to_captions.get(image_id, [])
-        if not caps:
-            continue
-        filtered_items.append((fname_png, caps[0]))
+    if captions_csv_path is not None:
+        df = pd.read_csv(captions_csv_path)
+        cap_col = "captions" if "captions" in df.columns else "caption"
+        filtered_items = [
+            (row["file_name"].replace(".jpg", ".png"), str(row[cap_col]))
+            for _, row in df.iterrows()
+            if str(row["file_name"]) not in ("None", "nan", "")
+        ]
+    else:
+        # JSON + log_files path (val2014-style)
+        with open(missing_files_path, "r") as f:
+            missing_filenames = [line.strip() for line in f if line.strip()]
+        with open(captions_json_path, "r") as f:
+            captions_data = json.load(f)
+        file_to_id = {img["file_name"]: img["id"] for img in captions_data["images"]}
+        id_to_captions: dict = defaultdict(list)
+        for ann in captions_data["annotations"]:
+            id_to_captions[ann["image_id"]].append(ann["caption"])
+        filtered_items = []
+        for fname in missing_filenames:
+            image_id = file_to_id.get(fname)
+            fname_png = fname.replace(".jpg", ".png")
+            if image_id is None:
+                continue
+            caps = id_to_captions.get(image_id, [])
+            if caps:
+                filtered_items.append((fname_png, caps[0]))
 
     selected_items = (
         random.Random(42).sample(filtered_items, num_select)
@@ -174,15 +185,25 @@ class SwittiControlTrainer:
         self.log_modality = (getattr(args, "control_modalities", None) or ["canny"])[0]
 
         # Load logging data (prompts + control images for eval visualisation)
+        eval_subset = getattr(args, "eval_subset", "val2014")
         try:
+            if eval_subset == "val2014":
+                caption_kwargs = dict(
+                    missing_files_path=os.path.join(args.data_path, "log_files.txt"),
+                    captions_json_path=os.path.join(
+                        args.data_path, "annotations", f"captions_{eval_subset}.json"
+                    ),
+                )
+            else:
+                caption_kwargs = dict(
+                    captions_csv_path=os.path.join(args.data_path, f"{eval_subset}.csv"),
+                )
             self.log_prompts, self.log_ctrl_dict = generate_logging_prompts_captions(
-                missing_files_path=os.path.join(args.data_path, "log_files.txt"),
-                captions_json_path=os.path.join(
-                    args.data_path, "annotations", "captions_val2014.json"
-                ),
                 ctrl_maps_dir=getattr(args, "ctrl_maps_dir", None),
                 control_modalities=getattr(args, "control_modalities", None),
                 final_reso=args.data_load_reso,
+                val_subset_name=eval_subset,
+                **caption_kwargs,
             )
         except Exception as e:
             print(f"[Warning] Could not load logging data ({e}); using EVAL_PROMPTS fallback.")
