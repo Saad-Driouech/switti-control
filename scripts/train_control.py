@@ -230,6 +230,9 @@ def main_training():
     tb_lg, trainer, start_it = build_everything(args)
     dist.barrier()
 
+    if start_it == 0:
+        save_model_state(0, args, trainer.control_net, trainer.optimizer)
+
     for cur_iter in range(start_it, args.max_iters):
         tb_lg.set_step(cur_iter)
 
