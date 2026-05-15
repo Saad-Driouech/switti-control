@@ -243,7 +243,7 @@ def run_cfg_sweep(cfg: dict, run: dict, cfg_values: list, sample_indices: list,
     top_k = cfg.get("top_k", 400)
     top_p = cfg.get("top_p", 0.95)
 
-    df = pd.read_csv(cfg["coco_csv"])
+    df = pd.read_csv(cfg["coco_csv"], quotechar='"', on_bad_lines="skip")
     # Only keep the requested indices
     rows = df.iloc[sample_indices]
 
@@ -301,7 +301,7 @@ def run_null_control(cfg: dict, run: dict, sample_indices: list, out_dir: Path):
     top_p = cfg.get("top_p", 0.95)
     control_end_si = cfg.get("control_end_si", 8)
 
-    df = pd.read_csv(cfg["coco_csv"])
+    df = pd.read_csv(cfg["coco_csv"], quotechar='"', on_bad_lines="skip")
     rows = df.iloc[sample_indices]
 
     pipe, device = _build_pipe(run, cfg)
