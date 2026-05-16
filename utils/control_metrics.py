@@ -540,7 +540,7 @@ def calculate_control_metrics(generated_images, control_tensors: list,
             metrics.update(calculate_hed_metrics(gen_list, ctrl_list))
         elif control_type == "openpose":
             metrics.update(calculate_pose_metrics(gen_list, ctrl_list))
-        elif control_type == "seg":
+        elif control_type in ("seg", "seg_cocostuff"):
             metrics.update(calculate_seg_metrics(gen_list, ctrl_list, device=device))
     except Exception as e:
         import traceback
