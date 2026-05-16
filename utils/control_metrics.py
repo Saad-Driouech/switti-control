@@ -801,7 +801,7 @@ def calculate_control_metrics(generated_images, control_dict, control_type, devi
             # Skeleton SSIM + skeleton pixel F1
             metrics.update(calculate_pose_metrics(valid_gen, valid_ctrl))
 
-        elif control_type == 'seg':
+        elif control_type in ('seg', 'seg_cocostuff'):
             # mIoU + pixel accuracy via COCO Mask R-CNN
             metrics.update(calculate_seg_metrics(valid_gen, valid_ctrl, device=device))
 
