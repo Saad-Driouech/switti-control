@@ -171,7 +171,10 @@ def _build_diffusers_sd15_controlnet(run: dict):
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
     pipe = pipe.to("cuda")
-    pipe.enable_xformers_memory_efficient_attention()
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pipe.enable_attention_slicing()
     return pipe
 
 
@@ -204,7 +207,10 @@ def _build_diffusers_sdxl_controlnet(run: dict):
         torch_dtype=torch.float16,
     )
     pipe = pipe.to("cuda")
-    pipe.enable_xformers_memory_efficient_attention()
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pipe.enable_attention_slicing()
     return pipe
 
 
@@ -230,15 +236,16 @@ def _bench_switti(run: dict, cfg: dict, prompt: str,
         control_dict = None
 
     def _generate():
-        pipe(
-            prompt=prompt,
-            cfg=guidance,
-            top_k=top_k,
-            top_p=top_p,
-            return_pil=False,
-            control_dict=control_dict,
-            control_end_si=control_end_si,
-        )
+        with torch.autocast("cuda"):
+            pipe(
+                prompt=prompt,
+                cfg=guidance,
+                top_k=top_k,
+                top_p=top_p,
+                return_pil=False,
+                control_dict=control_dict,
+                control_end_si=control_end_si,
+            )
 
     torch.cuda.reset_peak_memory_stats()
     mean_ms, std_ms = _cuda_time_ms(_generate, n_warmup, n_runs)
@@ -316,15 +323,16 @@ def _bench_switti_v2(run: dict, cfg: dict, prompt: str,
     )
 
     def _generate():
-        pipe(
-            prompt=prompt,
-            ctrl_image=ctrl_pil,
-            modality=modality,
-            cfg=guidance,
-            top_k=top_k,
-            top_p=top_p,
-            return_pil=False,
-        )
+        with torch.autocast("cuda"):
+            pipe(
+                prompt=prompt,
+                ctrl_image=ctrl_pil,
+                modality=modality,
+                cfg=guidance,
+                top_k=top_k,
+                top_p=top_p,
+                return_pil=False,
+            )
 
     torch.cuda.reset_peak_memory_stats()
     mean_ms, std_ms = _cuda_time_ms(_generate, n_warmup, n_runs)
