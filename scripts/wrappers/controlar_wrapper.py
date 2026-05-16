@@ -1,137 +1,172 @@
 """
-ControlAR wrapper for benchmark_speed.py.
+ControlAR wrapper for benchmark_speed.py — text-conditional (t2i) variant.
 
-Before using this wrapper:
-  1. Clone the ControlAR repo:
-       git clone https://github.com/hustvl/ControlAR.git /path/to/ControlAR
+ControlAR is a text-to-image model built on LlamaGen-XL that adds spatial
+control via conditional decoding. It uses a T5 (flan-t5-xl) text encoder,
+NOT class labels.
 
-  2. Download the ControlAR checkpoint and tokenizer from their HuggingFace
-     release (https://huggingface.co/hustvl/ControlAR) and note the paths.
+Cluster paths (already downloaded):
+  controlar_repo : /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR
+  vq_ckpt        : checkpoints/vq/vq_ds16_t2i.pt
+  gpt_ckpt       : checkpoints/llamagen/t2i_XL_stage2_512.pt
+  t5_path        : checkpoints/t5-ckpt
+  control_ckpt   : checkpoints/t2i/canny/canny_MR.safetensors
+                   checkpoints/t2i/hed/hed.safetensors
+                   checkpoints/t2i/depth/depth_MR.safetensors
+                   checkpoints/t2i/seg/seg_cocostuff.safetensors
 
-  3. Add ControlAR to PYTHONPATH:
-       export PYTHONPATH="/path/to/ControlAR:$PYTHONPATH"
-
-  4. Point the config at this file:
-       - name: ControlAR (canny, 256-token LlamaGen-XL)
-         type: custom
-         wrapper: scripts/wrappers/controlar_wrapper.py
-         modality: canny
-         # ControlAR-specific fields (read by load_pipe below):
-         controlar_repo: /path/to/ControlAR
-         vq_ckpt: /path/to/vq_ds16_c2i.pt
-         gpt_ckpt: /path/to/controlar_canny_xl.pt
-         gpt_model: GPT-XL            # GPT-B / GPT-L / GPT-XL
-         image_size: 256              # 256 or 512
-         num_classes: 1000            # ImageNet classes (not used for T2I, set to 1000)
-         cfg_scale: 4.0
-         top_k: 2000
-         top_p: 1.0
-         temperature: 1.0
-         num_sampling_steps: 256      # == image_size^2 / vq_stride^2
-         class_label: 207             # golden retriever; replace with target class
-
-This wrapper assumes the standard ControlAR model (class-conditional,
-ImageNet), which is the publicly released checkpoint. If you have a
-text-conditional variant, adjust load_pipe / generate accordingly.
+Config entry example:
+  - name: ControlAR (canny, t2i, 512px)
+    type: custom
+    wrapper: scripts/wrappers/controlar_wrapper.py
+    modality: canny
+    controlar_repo: /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR
+    vq_ckpt:      /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/vq/vq_ds16_t2i.pt
+    gpt_ckpt:     /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/llamagen/t2i_XL_stage2_512.pt
+    control_ckpt: /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/t2i/canny/canny_MR.safetensors
+    t5_path:      /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/t5-ckpt/checkpoints/t5-ckpt
+    t5_model_type: flan-t5-xl
+    image_size: 512
+    cfg_scale: 7.5
+    top_k: 2000
+    top_p: 1.0
+    temperature: 1.0
+    control_strength: 1.0
+    cls_token_num: 120
 """
 
 import os
 import sys
 
-import torch
 import numpy as np
+import torch
 from PIL import Image
 
 
 def load_pipe(run_cfg: dict):
-    """Build and return (vq_model, gpt_model, device) tuple."""
-    repo = run_cfg.get("controlar_repo", "")
-    if repo and repo not in sys.path:
+    repo = run_cfg["controlar_repo"]
+    if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    # ControlAR imports (available after PYTHONPATH is set)
     from tokenizer.tokenizer_image.vq_model import VQ_models
-    from autoregressive.models.gpt import GPT_models
+    from autoregressive.models.gpt_t2i import GPT_models
+    from language.t5 import T5Embedder
 
     device = torch.device("cuda")
-    image_size = run_cfg.get("image_size", 256)
-    vq_model_name = run_cfg.get("vq_model", "VQ-16")
+    precision = torch.bfloat16
+    image_size = run_cfg.get("image_size", 512)
+    downsample_size = 16  # VQ-16
+    latent_size = image_size // downsample_size
 
-    # Build and load VQ tokenizer
-    vq_model = VQ_models[vq_model_name](
+    # VQ tokenizer
+    vq_model = VQ_models["VQ-16"](
         codebook_size=16384,
         codebook_embed_dim=8,
-    ).to(device)
-    vq_model.eval()
-    vq_ckpt = run_cfg.get("vq_ckpt")
-    if vq_ckpt:
-        checkpoint = torch.load(vq_ckpt, map_location="cpu")
-        vq_model.load_state_dict(checkpoint["model"])
+    ).to(device).eval()
+    ckpt = torch.load(run_cfg["vq_ckpt"], map_location="cpu")
+    vq_model.load_state_dict(ckpt["model"])
+    del ckpt
 
-    # Build and load GPT (ControlAR)
-    gpt_model_name = run_cfg.get("gpt_model", "GPT-XL")
-    num_classes = run_cfg.get("num_classes", 1000)
-    gpt_model = GPT_models[gpt_model_name](
-        vocab_size=16384,
-        block_size=256,          # 256 tokens for 256x256; 1024 for 512x512
-        num_classes=num_classes,
-        cls_token_num=1,
-        model_type="c2i",
+    # GPT (t2i)
+    cls_token_num = run_cfg.get("cls_token_num", 120)
+    gpt_model = GPT_models["GPT-XL"](
+        block_size=latent_size ** 2,
+        cls_token_num=cls_token_num,
+        model_type="t2i",
         condition_type=run_cfg.get("modality", "canny"),
-    ).to(device)
-    gpt_model.eval()
-    gpt_ckpt = run_cfg.get("gpt_ckpt")
-    if gpt_ckpt:
-        checkpoint = torch.load(gpt_ckpt, map_location="cpu")
-        state_dict = checkpoint.get("model", checkpoint)
-        gpt_model.load_state_dict(state_dict, strict=False)
+    ).to(device=device, dtype=precision).eval()
 
-    return {"vq": vq_model, "gpt": gpt_model, "device": device}
+    # Load base t2i weights
+    base_ckpt = torch.load(run_cfg["gpt_ckpt"], map_location="cpu")
+    base_sd = base_ckpt.get("model", base_ckpt.get("module", base_ckpt))
+    gpt_model.load_state_dict(base_sd, strict=False)
+    del base_ckpt
+
+    # Load control adapter weights (safetensors)
+    control_ckpt = run_cfg.get("control_ckpt")
+    if control_ckpt and os.path.exists(control_ckpt):
+        from safetensors.torch import load_file
+        control_sd = load_file(control_ckpt)
+        gpt_model.load_state_dict(control_sd, strict=False)
+
+    # T5 text encoder
+    t5_model = T5Embedder(
+        device=device,
+        local_cache=True,
+        cache_dir=run_cfg["t5_path"],
+        dir_or_name=run_cfg.get("t5_model_type", "flan-t5-xl"),
+        torch_dtype=precision,
+        model_max_length=cls_token_num,
+    )
+
+    return {
+        "vq": vq_model,
+        "gpt": gpt_model,
+        "t5": t5_model,
+        "device": device,
+        "precision": precision,
+        "image_size": image_size,
+        "downsample_size": downsample_size,
+        "cls_token_num": cls_token_num,
+    }
 
 
 def generate(pipe: dict, prompt: str, ctrl_pil: Image.Image, run_cfg: dict):
-    """
-    One forward pass.  `prompt` is ignored (model is class-conditional);
-    class_label from run_cfg is used instead.
-    """
-    from autoregressive.models.gpt import GPT_models
+    from autoregressive.models.generate import generate as ar_generate
 
     vq_model = pipe["vq"]
     gpt_model = pipe["gpt"]
+    t5_model = pipe["t5"]
     device = pipe["device"]
+    precision = pipe["precision"]
+    image_size = pipe["image_size"]
+    downsample_size = pipe["downsample_size"]
+    cls_token_num = pipe["cls_token_num"]
 
-    image_size = run_cfg.get("image_size", 256)
-    class_label = run_cfg.get("class_label", 207)
-    cfg_scale = run_cfg.get("cfg_scale", 4.0)
+    cfg_scale = run_cfg.get("cfg_scale", 7.5)
+    temperature = run_cfg.get("temperature", 1.0)
     top_k = run_cfg.get("top_k", 2000)
     top_p = run_cfg.get("top_p", 1.0)
-    temperature = run_cfg.get("temperature", 1.0)
-    num_sampling_steps = run_cfg.get("num_sampling_steps", image_size * image_size // 256)
+    control_strength = run_cfg.get("control_strength", 1.0)
 
-    # Preprocess control image
+    # Control image: resize, convert to [-1, 1], duplicate for CFG
     ctrl = ctrl_pil.resize((image_size, image_size)).convert("RGB")
     ctrl_t = torch.from_numpy(np.array(ctrl, dtype=np.float32) / 255.0)
-    ctrl_t = ctrl_t.permute(2, 0, 1).unsqueeze(0).to(device)
+    ctrl_t = ctrl_t.permute(2, 0, 1).unsqueeze(0)          # (1, 3, H, W)
+    ctrl_t = 2.0 * ctrl_t - 1.0                             # [-1, 1]
+    ctrl_t = ctrl_t.repeat(2, 1, 1, 1).to(device, dtype=precision)  # (2, 3, H, W)
 
-    c_indices = torch.tensor([class_label], device=device)
-    # Unconditional token for CFG
-    uc_indices = torch.tensor([1000], device=device)  # null class
+    # Text embeddings (duplicate for CFG: [cond, uncond])
+    prompts = [prompt, ""]
+    caption_embs, emb_masks = t5_model.get_text_embeddings(prompts)
 
-    with torch.no_grad(), torch.cuda.amp.autocast():
-        # Standard ControlAR sampling loop: the model generates tokens
-        # conditioned on (class, control_image) via its generate() method.
-        index_sample = gpt_model.generate(
-            cond=c_indices,
-            cond_null=uc_indices,
-            condition_image=ctrl_t,
-            max_new_tokens=num_sampling_steps,
-            emb_masks=None,
-            cfg_scale=cfg_scale,
-            cfg_interval=[-1, num_sampling_steps],
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            sample_logits=True,
+    # Left-padding (matches official sample_t2i.py)
+    new_caption_embs = []
+    for caption_emb, emb_mask in zip(caption_embs, emb_masks):
+        valid_num = int(emb_mask.sum().item())
+        new_caption_embs.append(
+            torch.cat([caption_emb[valid_num:], caption_emb[:valid_num]])
         )
-        # Decode tokens → image
-        vq_model.decode_code(index_sample, shape=(1, 8, image_size // 16, image_size // 16))
+    new_caption_embs = torch.stack(new_caption_embs)
+    new_emb_masks = torch.flip(emb_masks, dims=[-1])
+
+    c_indices = new_caption_embs * new_emb_masks[:, :, None]
+    c_emb_masks = new_emb_masks
+
+    latent_size = image_size // downsample_size
+    qzshape = [2, 8, latent_size, latent_size]
+
+    index_sample = ar_generate(
+        gpt_model,
+        c_indices,
+        latent_size ** 2,
+        c_emb_masks,
+        condition=ctrl_t,
+        cfg_scale=cfg_scale,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        sample_logits=True,
+        control_strength=control_strength,
+    )
+    vq_model.decode_code(index_sample, qzshape)

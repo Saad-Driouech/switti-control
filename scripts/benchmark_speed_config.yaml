@@ -54,6 +54,19 @@ runs:
     control_pretrained: true
 
   # ----------------------------------------------------------
+  # Approach 1 — DINOv2 additive fusion (canny as representative)
+  # ----------------------------------------------------------
+  - name: Approach 1 (add, canny)
+    type: switti
+    modality: canny
+    ckpt: /home/woody/iwnt/iwnt134h/switti/tensorboard/train_control_first/local_output_swittiP_vaeP_dinov2b_canny_add_freeze/model_state_dict.pt
+    control_encoder_type: vit
+    control_encoder_ckpt: vit_base_patch14_dinov2
+    control_context_dim: 384
+    control_fusion: add
+    control_pretrained: true
+
+  # ----------------------------------------------------------
   # Approach 2 — ControlNet-style parallel branch (canny)
   # Uses SwittiControlNet + SwittiControlPipeline (spatial-control-v2.0 branch)
   # ----------------------------------------------------------
@@ -94,29 +107,23 @@ runs:
     num_inference_steps: 20
 
   # ----------------------------------------------------------
-  # AR baseline: ControlAR (LlamaGen-XL, class-conditional)
-  # Requires: git clone https://github.com/hustvl/ControlAR
-  #           + download checkpoints from HuggingFace (hustvl/ControlAR)
-  #           + export PYTHONPATH="/path/to/ControlAR:$PYTHONPATH"
-  # See scripts/wrappers/controlar_wrapper.py for setup instructions.
+  # AR baseline: ControlAR (LlamaGen-XL, text-conditional, 512px)
+  # Repo already cloned on cluster; all checkpoints already downloaded.
   # ----------------------------------------------------------
-  - name: ControlAR (canny, GPT-XL, 256px)
+  - name: ControlAR (canny, t2i, 512px)
     type: custom
     wrapper: scripts/wrappers/controlar_wrapper.py
     modality: canny
-    # ---- paths (edit these) ----
-    controlar_repo: /path/to/ControlAR
-    vq_ckpt: /path/to/vq_ds16_c2i.pt
-    gpt_ckpt: /path/to/controlar_canny_xl.pt
-    # ---- model settings ----
-    gpt_model: GPT-XL
-    vq_model: VQ-16
-    image_size: 256
-    num_classes: 1000
-    num_sampling_steps: 256
-    # ---- sampling ----
-    cfg_scale: 4.0
+    controlar_repo: /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR
+    vq_ckpt:      /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/vq/vq_ds16_t2i.pt
+    gpt_ckpt:     /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/llamagen/t2i_XL_stage2_512.pt
+    control_ckpt: /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/t2i/canny/canny_MR.safetensors
+    t5_path:      /home/hpc/iwnt/iwnt134h/thesis/repos/ControlAR/checkpoints/t5-ckpt
+    t5_model_type: flan-t5-xl
+    image_size: 512
+    cls_token_num: 120
+    cfg_scale: 7.5
     top_k: 2000
     top_p: 1.0
     temperature: 1.0
-    class_label: 207   # golden retriever (ImageNet); replace as needed
+    control_strength: 1.0
