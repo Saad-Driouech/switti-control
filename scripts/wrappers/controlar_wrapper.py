@@ -48,6 +48,10 @@ def load_pipe(run_cfg: dict):
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
+    # dinov2_adapter.py uses a relative path for from_pretrained — must run from repo root
+    _orig_cwd = os.getcwd()
+    os.chdir(repo)
+
     from tokenizer.tokenizer_image.vq_model import VQ_models
     from autoregressive.models.gpt_t2i import GPT_models
     from language.t5 import T5Embedder
@@ -98,6 +102,8 @@ def load_pipe(run_cfg: dict):
         torch_dtype=precision,
         model_max_length=cls_token_num,
     )
+
+    os.chdir(_orig_cwd)
 
     return {
         "vq": vq_model,
