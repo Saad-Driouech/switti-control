@@ -132,10 +132,6 @@ def _build_switti_pipe(run: dict, cfg: dict):
     switti.eval().to(device)
     vae_local.eval()
 
-    # bfloat16: same memory as fp16 but float32 exponent range avoids inf/nan in logits
-    switti.to(torch.bfloat16)
-    vae_local.to(torch.bfloat16)
-
     return pipe
 
 
@@ -231,13 +227,12 @@ def _bench_switti(run: dict, cfg: dict, prompt: str,
 
     if has_control and control_img_tensor is not None:
         modality = run.get("modality", "canny")
-        control_dict = {modality: control_img_tensor.cuda().to(torch.bfloat16).unsqueeze(0)}
+        control_dict = {modality: control_img_tensor.cuda().unsqueeze(0)}
     else:
         control_dict = None
 
     def _generate():
-        with torch.autocast("cuda"):
-            pipe(
+        pipe(
                 prompt=prompt,
                 cfg=guidance,
                 top_k=top_k,
@@ -323,8 +318,7 @@ def _bench_switti_v2(run: dict, cfg: dict, prompt: str,
     )
 
     def _generate():
-        with torch.autocast("cuda"):
-            pipe(
+        pipe(
                 prompt=prompt,
                 ctrl_image=ctrl_pil,
                 modality=modality,
